@@ -72,6 +72,8 @@ public class RaftMessageHandler extends SimpleChannelInboundHandler<RpcMessage> 
             coreDelegate.onInstallSnapshotResponse((InstallSnapshotResponse) msg);
         } else if (msg instanceof ClientWriteRequest) {
             coreDelegate.onClientWriteRequest((ClientWriteRequest) msg, channel);
+        } else if (msg instanceof ClientWriteResponse) {
+            coreDelegate.onClientWriteResponse((ClientWriteResponse) msg);
         } else if (msg instanceof ClientReadRequest) {
             coreDelegate.onClientReadRequest((ClientReadRequest) msg, channel);
         } else if (msg instanceof MembershipChangeRequest) {
@@ -105,6 +107,7 @@ public class RaftMessageHandler extends SimpleChannelInboundHandler<RpcMessage> 
         void onInstallSnapshotRequest(InstallSnapshotRequest request, Channel channel);
         void onInstallSnapshotResponse(InstallSnapshotResponse response);
         void onClientWriteRequest(ClientWriteRequest request, Channel channel);
+        void onClientWriteResponse(ClientWriteResponse response);
         void onClientReadRequest(ClientReadRequest request, Channel channel);
         void onMembershipChangeRequest(MembershipChangeRequest request, Channel channel);
     }

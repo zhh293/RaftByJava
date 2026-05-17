@@ -21,11 +21,14 @@ public class TimerManager {
     private final int electionTimeoutMinMs;
     private final int electionTimeoutMaxMs;
     private final int heartbeatIntervalMs;
+    private final int campaignTimeoutMs;
 
     private ScheduledFuture<?> electionTimer;
+    private ScheduledFuture<?> campaignTimer;
     private ScheduledFuture<?> heartbeatTimer;
 
     private volatile Runnable electionTimeoutCallback;
+    private volatile Runnable campaignTimeoutCallback;
     private volatile Runnable heartbeatCallback;
 
     public TimerManager(ScheduledExecutorService executor, RaftConfig config) {
@@ -33,10 +36,17 @@ public class TimerManager {
         this.electionTimeoutMinMs = config.getElectionTimeoutMinMs();
         this.electionTimeoutMaxMs = config.getElectionTimeoutMaxMs();
         this.heartbeatIntervalMs = config.getHeartbeatIntervalMs();
+        // Campaign timeout: use the max election timeout as a reasonable upper bound
+        // for how long a candidate should wait before giving up and retrying.
+        this.campaignTimeoutMs = config.getElectionTimeoutMaxMs();
     }
 
     public void setElectionTimeoutCallback(Runnable callback) {
         this.electionTimeoutCallback = callback;
+    }
+
+    public void setCampaignTimeoutCallback(Runnable callback) {
+        this.campaignTimeoutCallback = callback;
     }
 
     public void setHeartbeatCallback(Runnable callback) {
@@ -56,6 +66,24 @@ public class TimerManager {
         if (electionTimer != null) {
             electionTimer.cancel(false);
             electionTimer = null;
+        }
+    }
+
+    /**
+     * Start a campaign timer. This fires once after campaignTimeoutMs.
+     * If the candidate hasn't won by then, it should retry or step down.
+     */
+    public void startCampaignTimer() {
+        cancelCampaignTimer();
+        campaignTimer = executor.schedule(this::onCampaignTimeout, campaignTimeoutMs, TimeUnit.MILLISECONDS);
+        log.debug("Campaign timer started: {}ms", campaignTimeoutMs);
+    }
+
+    /** Cancel the campaign timer. */
+    public void cancelCampaignTimer() {
+        if (campaignTimer != null) {
+            campaignTimer.cancel(false);
+            campaignTimer = null;
         }
     }
 
@@ -84,6 +112,12 @@ public class TimerManager {
         }
     }
 
+    private void onCampaignTimeout() {
+        if (campaignTimeoutCallback != null) {
+            campaignTimeoutCallback.run();
+        }
+    }
+
     private void onHeartbeat() {
         if (heartbeatCallback != null) {
             heartbeatCallback.run();
@@ -92,6 +126,7 @@ public class TimerManager {
 
     public void shutdown() {
         cancelElectionTimer();
+        cancelCampaignTimer();
         stopHeartbeat();
     }
 }

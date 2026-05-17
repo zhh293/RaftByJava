@@ -8,6 +8,7 @@ import com.raft.rpc.message.InstallSnapshotRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -116,12 +117,23 @@ public class ReplicationManager {
             return;
         }
 
+        // Serialize session data for transport
+        Map<String, Map<String, Object>> serializedSessions = new HashMap<>();
+        for (Map.Entry<String, ClientSessionTable.SessionEntry> e :
+                snapshotManager.getLastSnapshotSessions().entrySet()) {
+            Map<String, Object> entry = new HashMap<>();
+            entry.put("sequenceNumber", e.getValue().getSequenceNumber());
+            entry.put("response", e.getValue().getResponse());
+            serializedSessions.put(e.getKey(), entry);
+        }
+
         InstallSnapshotRequest request = new InstallSnapshotRequest(
                 state.getCurrentTerm(),
                 selfId,
                 snapshotManager.getLastIncludedIndex(),
                 snapshotManager.getLastIncludedTerm(),
-                snapshotManager.getLastSnapshotData()
+                snapshotManager.getLastSnapshotData(),
+                serializedSessions
         );
 
         peerManager.sendToPeer(peerId, request);

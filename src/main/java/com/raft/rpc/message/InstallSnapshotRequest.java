@@ -20,6 +20,7 @@ public class InstallSnapshotRequest extends RpcMessage {
     private final int lastIncludedIndex;
     private final int lastIncludedTerm;
     private final Map<String, String> snapshotData;
+    private final Map<String, Map<String, Object>> snapshotSessions;
 
     @JsonCreator
     public InstallSnapshotRequest(
@@ -27,12 +28,14 @@ public class InstallSnapshotRequest extends RpcMessage {
             @JsonProperty("leaderId") String leaderId,
             @JsonProperty("lastIncludedIndex") int lastIncludedIndex,
             @JsonProperty("lastIncludedTerm") int lastIncludedTerm,
-            @JsonProperty("snapshotData") Map<String, String> snapshotData) {
+            @JsonProperty("snapshotData") Map<String, String> snapshotData,
+            @JsonProperty("snapshotSessions") Map<String, Map<String, Object>> snapshotSessions) {
         this.term = term;
         this.leaderId = leaderId;
         this.lastIncludedIndex = lastIncludedIndex;
         this.lastIncludedTerm = lastIncludedTerm;
         this.snapshotData = snapshotData;
+        this.snapshotSessions = snapshotSessions;
     }
 
     public int getTerm() { return term; }
@@ -40,6 +43,7 @@ public class InstallSnapshotRequest extends RpcMessage {
     public int getLastIncludedIndex() { return lastIncludedIndex; }
     public int getLastIncludedTerm() { return lastIncludedTerm; }
     public Map<String, String> getSnapshotData() { return snapshotData; }
+    public Map<String, Map<String, Object>> getSnapshotSessions() { return snapshotSessions; }
 
     @Override
     public String toString() {

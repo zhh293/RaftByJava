@@ -109,12 +109,14 @@ public class RaftNode {
         boolean hasSnapshot = snapshotManager.loadSnapshot();
         if (hasSnapshot) {
             stateMachine.restoreFromSnapshot(snapshotManager.getLastSnapshotData());
+            sessionTable.restoreFromSnapshot(snapshotManager.getLastSnapshotSessions());
             logManager.applySnapshot(
                     snapshotManager.getLastIncludedIndex(),
                     snapshotManager.getLastIncludedTerm());
-            log.info("Recovered snapshot: lastIndex={}, lastTerm={}",
+            log.info("Recovered snapshot: lastIndex={}, lastTerm={}, sessions={}",
                     snapshotManager.getLastIncludedIndex(),
-                    snapshotManager.getLastIncludedTerm());
+                    snapshotManager.getLastIncludedTerm(),
+                    sessionTable.size());
         }
 
         // Load WAL entries

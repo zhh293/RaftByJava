@@ -42,6 +42,7 @@ public class RaftCore implements RaftCoreDelegate {
 
     // --- candidate state ---
     private final Set<String> voteGrants = new HashSet<>();
+    private int voteRejects = 0;
     private int candidateTerm = -1;
 
     // --- Pre-Vote state ---
@@ -58,6 +59,9 @@ public class RaftCore implements RaftCoreDelegate {
 
     // --- membership change tracking ---
     private boolean membershipChangeInProgress = false;
+
+    // --- forwarded writes: track original client channels for forwarded write requests ---
+    private final Map<String, Channel> forwardedWriteChannels = new HashMap<>();
 
     public RaftCore(RaftConfig config,
                     NodeState state,
@@ -84,6 +88,7 @@ public class RaftCore implements RaftCoreDelegate {
 
         // Wire up timer callbacks
         timerManager.setElectionTimeoutCallback(this::onElectionTimeout);
+        timerManager.setCampaignTimeoutCallback(this::onCampaignTimeout);
         timerManager.setHeartbeatCallback(this::sendHeartbeat);
     }
 
@@ -150,6 +155,25 @@ public class RaftCore implements RaftCoreDelegate {
         candidateTerm = state.getCurrentTerm();
         voteGrants.clear();
         voteGrants.add(selfId);
+        voteRejects = 0;
+        // Cancel the election timer (it's for followers); start the campaign timer instead
+        timerManager.cancelElectionTimer();
+        timerManager.startCampaignTimer();
+    }
+
+    /**
+     * Campaign timeout: the candidate failed to collect a majority within the
+     * allotted time. Step back to follower and let the election timer re-fire.
+     */
+    private void onCampaignTimeout() {
+        if (!state.isCandidate()) {
+            return;
+        }
+        log.info("Campaign timeout for term {}, reverting to FOLLOWER", state.getCurrentTerm());
+        state.setRole(NodeRole.FOLLOWER);
+        voteGrants.clear();
+        voteRejects = 0;
+        timerManager.cancelCampaignTimer();
         timerManager.resetElectionTimer();
     }
 
@@ -320,13 +344,24 @@ public class RaftCore implements RaftCoreDelegate {
 
         if (resp.isVoteGranted()) {
             voteGrants.add("voter-" + voteGrants.size());
+        } else {
+            voteRejects++;
         }
 
         int grantedCount = voteGrants.size();
-        log.debug("Vote count: {}/{}", grantedCount, majorityCount);
+        log.debug("Vote count: granted={}/{}, rejected={}", grantedCount, majorityCount, voteRejects);
 
         if (grantedCount >= majorityCount) {
+            timerManager.cancelCampaignTimer();
             becomeLeader();
+        } else if (voteRejects >= majorityCount) {
+            // Majority rejected — no chance of winning, revert to follower immediately
+            log.info("Majority rejected vote request ({} rejects), stepping back to FOLLOWER", voteRejects);
+            timerManager.cancelCampaignTimer();
+            state.setRole(NodeRole.FOLLOWER);
+            voteGrants.clear();
+            voteRejects = 0;
+            timerManager.resetElectionTimer();
         }
     }
 
@@ -348,10 +383,22 @@ public class RaftCore implements RaftCoreDelegate {
         state.setLeaderId(req.getLeaderId());
         timerManager.resetElectionTimer();
 
-        // Install the snapshot
+        // Deserialize session entries from the request
+        Map<String, ClientSessionTable.SessionEntry> sessions = new HashMap<>();
+        if (req.getSnapshotSessions() != null) {
+            for (Map.Entry<String, Map<String, Object>> e : req.getSnapshotSessions().entrySet()) {
+                Map<String, Object> vals = e.getValue();
+                long seq = ((Number) vals.get("sequenceNumber")).longValue();
+                String resp = vals.get("response") != null ? vals.get("response").toString() : null;
+                sessions.put(e.getKey(), new ClientSessionTable.SessionEntry(seq, resp));
+            }
+        }
+
+        // Install the snapshot (including session table)
         snapshotManager.installSnapshot(
                 req.getLastIncludedIndex(), req.getLastIncludedTerm(),
-                req.getSnapshotData(), stateMachine, logManager);
+                req.getSnapshotData(), sessions,
+                stateMachine, logManager, sessionTable);
 
         send(channel, new InstallSnapshotResponse(state.getCurrentTerm()));
     }
@@ -381,14 +428,19 @@ public class RaftCore implements RaftCoreDelegate {
         state.setLeaderId(null);
         state.clearLeaderState();
         timerManager.stopHeartbeat();
+        timerManager.cancelCampaignTimer();
         timerManager.resetElectionTimer();
         voteGrants.clear();
+        voteRejects = 0;
         preVoteInProgress = false;
         preVoteGrants.clear();
 
         // Fail all pending writes
         failPendingWrites("leader stepped down");
         pendingReads.clear();
+
+        // Fail any forwarded writes waiting for a leader response
+        failForwardedWrites("lost leader connection");
     }
 
     private void becomeLeader() {
@@ -436,12 +488,14 @@ public class RaftCore implements RaftCoreDelegate {
     @Override
     public void onClientWriteRequest(ClientWriteRequest req, Channel channel) {
         if (!state.isLeader()) {
-            String hint = state.getLeaderId();
-            if (hint == null) {
+            String leaderId = state.getLeaderId();
+            if (leaderId == null) {
                 log.warn("Client write rejected: no leader elected yet");
                 send(channel, ClientWriteResponse.noLeader());
             } else {
-                send(channel, ClientWriteResponse.redirect(hint));
+                // Forward the write request to the leader on behalf of the client
+                log.debug("Forwarding write request to leader {}", leaderId);
+                forwardWriteToLeader(leaderId, req, channel);
             }
             return;
         }
@@ -451,7 +505,12 @@ public class RaftCore implements RaftCoreDelegate {
             String cached = sessionTable.getCachedResponse(req.getClientId());
             log.info("Duplicate write from client {}, seq={}, returning cached response",
                     req.getClientId(), req.getSequenceNumber());
-            send(channel, ClientWriteResponse.ok(cached != null ? cached : "duplicate"));
+            String result = cached != null ? cached : "duplicate";
+            if (req.isForwarded()) {
+                send(channel, ClientWriteResponse.okForwarded(result, req.getForwardingId()));
+            } else {
+                send(channel, ClientWriteResponse.ok(result));
+            }
             return;
         }
 
@@ -460,7 +519,8 @@ public class RaftCore implements RaftCoreDelegate {
         log.info("Appended client write at index {}: {}", entry.getIndex(), req.getCommand());
 
         // Track pending write — will be resolved when committed
-        pendingWrites.put(entry.getIndex(), new PendingWrite(entry.getIndex(), channel, req.getCommand()));
+        pendingWrites.put(entry.getIndex(), new PendingWrite(
+                entry.getIndex(), channel, req.getCommand(), req.getForwardingId()));
 
         // Replicate to peers
         replicationManager.replicateLog(entry);
@@ -474,15 +534,87 @@ public class RaftCore implements RaftCoreDelegate {
     }
 
     // ================================================================
+    // Forwarded write request handling
+    // ================================================================
+
+    /**
+     * Forward a client write request to the known leader.
+     * The original client channel is remembered so we can relay the response.
+     */
+    private void forwardWriteToLeader(String leaderId, ClientWriteRequest req, Channel clientChannel) {
+        String fwdId = selfId + "-fwd-" + System.nanoTime();
+        forwardedWriteChannels.put(fwdId, clientChannel);
+
+        ClientWriteRequest forwarded = new ClientWriteRequest(
+                req.getClientId(), req.getSequenceNumber(), req.getCommand(), fwdId);
+        peerManager.sendToPeer(leaderId, forwarded);
+    }
+
+    /**
+     * Handle a ClientWriteResponse received from the leader (for forwarded writes).
+     * Relay the response back to the original client.
+     */
+    @Override
+    public void onClientWriteResponse(ClientWriteResponse resp) {
+        String fwdId = resp.getForwardingId();
+        if (fwdId == null) {
+            return; // Not a forwarded response, ignore
+        }
+        Channel clientChannel = forwardedWriteChannels.remove(fwdId);
+        if (clientChannel != null) {
+            // Relay to the original client — strip the forwardingId
+            send(clientChannel, new ClientWriteResponse(
+                    resp.isSuccess(), resp.getLeaderHint(), resp.getResult(), null));
+            log.debug("Relayed forwarded write response to client, fwdId={}", fwdId);
+        }
+    }
+
+    /**
+     * Fail all forwarded writes waiting for a leader response
+     * (e.g. when we step down or lose the leader).
+     */
+    private void failForwardedWrites(String reason) {
+        for (Map.Entry<String, Channel> entry : forwardedWriteChannels.entrySet()) {
+            Channel ch = entry.getValue();
+            if (ch != null && ch.isActive()) {
+                send(ch, ClientWriteResponse.noLeader());
+            }
+        }
+        forwardedWriteChannels.clear();
+    }
+
+    // ================================================================
     // Client Read — Linearizable via ReadIndex
     // ================================================================
 
     @Override
     public void onClientReadRequest(ClientReadRequest req, Channel channel) {
+        // ------------------------------------------------------------------
+        // Eventual-consistency reads: can be served by any node.
+        // The client may specify a minAppliedIndex to enforce a freshness
+        // guarantee (monotonic-read). If the node hasn't caught up, it rejects.
+        // ------------------------------------------------------------------
+        if (!req.isLinearizable()) {
+            int lastApplied = logManager.getLastApplied();
+            if (req.getMinAppliedIndex() > 0 && lastApplied < req.getMinAppliedIndex()) {
+                log.debug("Stale read rejected: appliedIndex={} < minRequired={}",
+                        lastApplied, req.getMinAppliedIndex());
+                send(channel, ClientReadResponse.stale(
+                        req.getKey(), lastApplied, req.getMinAppliedIndex()));
+                return;
+            }
+            String value = stateMachine.get(req.getKey());
+            send(channel, ClientReadResponse.ok(req.getKey(), value, lastApplied));
+            return;
+        }
+
+        // ------------------------------------------------------------------
+        // Linearizable reads: must go through the Leader via ReadIndex.
+        // ------------------------------------------------------------------
         if (!state.isLeader()) {
             String hint = state.getLeaderId();
             if (hint == null) {
-                log.warn("Client read rejected: no leader elected yet");
+                log.warn("Client linearizable read rejected: no leader elected yet");
                 send(channel, ClientReadResponse.noLeader());
             } else {
                 send(channel, ClientReadResponse.redirect(hint));
@@ -500,7 +632,7 @@ public class RaftCore implements RaftCoreDelegate {
         // If appliedIndex already covers readIndex, serve immediately
         if (logManager.getLastApplied() >= readIndex) {
             String value = stateMachine.get(req.getKey());
-            send(channel, ClientReadResponse.ok(req.getKey(), value));
+            send(channel, ClientReadResponse.ok(req.getKey(), value, logManager.getLastApplied()));
             return;
         }
 
@@ -585,7 +717,7 @@ public class RaftCore implements RaftCoreDelegate {
 
         // Check if snapshot compaction is needed
         if (snapshotManager != null && snapshotManager.shouldCompact(logManager.size())) {
-            snapshotManager.takeSnapshot(stateMachine, logManager);
+            snapshotManager.takeSnapshot(stateMachine, logManager, sessionTable);
         }
     }
 
@@ -634,6 +766,12 @@ public class RaftCore implements RaftCoreDelegate {
                 if (pw.getCommand().startsWith("CONFIG:")) {
                     send(pw.getClientChannel(),
                             MembershipChangeResponse.ok("membership change committed at index " + pw.getLogIndex()));
+                } else if (pw.isForwarded()) {
+                    // This write was forwarded by a follower — send response with forwardingId
+                    // so the follower can relay it back to the original client
+                    send(pw.getClientChannel(),
+                            ClientWriteResponse.okForwarded(
+                                    "committed at index " + pw.getLogIndex(), pw.getForwardingId()));
                 } else {
                     send(pw.getClientChannel(),
                             ClientWriteResponse.ok("committed at index " + pw.getLogIndex()));
@@ -650,6 +788,9 @@ public class RaftCore implements RaftCoreDelegate {
         for (PendingWrite pw : pendingWrites.values()) {
             if (pw.getCommand().startsWith("CONFIG:")) {
                 send(pw.getClientChannel(), MembershipChangeResponse.fail(reason));
+            } else if (pw.isForwarded()) {
+                send(pw.getClientChannel(),
+                        ClientWriteResponse.failForwarded(reason, pw.getForwardingId()));
             } else {
                 send(pw.getClientChannel(),
                         ClientWriteResponse.noLeader());
@@ -673,7 +814,7 @@ public class RaftCore implements RaftCoreDelegate {
             PendingRead pr = it.next();
             if (lastApplied >= pr.readIndex) {
                 String value = stateMachine.get(pr.key);
-                send(pr.channel, ClientReadResponse.ok(pr.key, value));
+                send(pr.channel, ClientReadResponse.ok(pr.key, value, lastApplied));
                 it.remove();
             }
         }
