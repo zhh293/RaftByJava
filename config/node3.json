@@ -9,5 +9,7 @@
   ],
   "electionTimeoutMinMs": 150,
   "electionTimeoutMaxMs": 300,
-  "heartbeatIntervalMs": 50
+  "heartbeatIntervalMs": 50,
+  "dataDir": "data/node3",
+  "snapshotThreshold": 1000
 }

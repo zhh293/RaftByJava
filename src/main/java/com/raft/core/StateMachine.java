@@ -18,7 +18,7 @@ public class StateMachine {
      * Apply a command string to the state machine.
      */
     public void apply(String command) {
-        if (command == null || command.isBlank()) {
+        if (command == null || command.trim().isEmpty()) {
             return;
         }
         if (command.startsWith("set ")) {
@@ -30,6 +30,8 @@ public class StateMachine {
             String key = command.substring(7);
             store.remove(key);
         }
+        // Membership change commands (CONFIG:ADD/CONFIG:REMOVE) are handled
+        // by RaftCore, not the KV state machine, so we silently ignore them here.
     }
 
     public String get(String key) {
@@ -40,8 +42,21 @@ public class StateMachine {
         return store.containsKey(key);
     }
 
+    /**
+     * Return a deep copy of the current state (for snapshot).
+     */
     public Map<String, String> snapshot() {
         return new HashMap<>(store);
+    }
+
+    /**
+     * Restore state machine from a snapshot. Replaces all existing state.
+     */
+    public void restoreFromSnapshot(Map<String, String> data) {
+        store.clear();
+        if (data != null) {
+            store.putAll(data);
+        }
     }
 
     public int size() {

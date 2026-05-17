@@ -3,6 +3,7 @@ package com.raft.core;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -68,7 +69,7 @@ class LogManagerTest {
 
     @Test
     void syncFromWithEmptyLogAppendsAll() {
-        List<LogEntry> entries = List.of(
+        List<LogEntry> entries = Arrays.asList(
                 new LogEntry(1, 1, "a"),
                 new LogEntry(1, 2, "b")
         );
@@ -82,7 +83,7 @@ class LogManagerTest {
         log.append(1, "old-b");  // index 2, term 1
 
         // New leader has different entry at index 1
-        List<LogEntry> newEntries = List.of(
+        List<LogEntry> newEntries = Arrays.asList(
                 new LogEntry(2, 1, "new-a"),
                 new LogEntry(2, 2, "new-b")
         );

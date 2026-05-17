@@ -50,7 +50,7 @@ class StateMachineTest {
     @Test
     void snapshotReturnsCopy() {
         sm.apply("set a=1");
-        var snap = sm.snapshot();
+        java.util.Map<String, String> snap = sm.snapshot();
         snap.put("a", "modified");
         assertEquals("1", sm.get("a"));
     }

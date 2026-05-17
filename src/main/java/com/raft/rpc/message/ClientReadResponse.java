@@ -34,6 +34,10 @@ public class ClientReadResponse extends RpcMessage {
         return new ClientReadResponse(false, leaderHint, null, null);
     }
 
+    public static ClientReadResponse noLeader() {
+        return new ClientReadResponse(false, null, null, "NO_LEADER: cluster is electing, please retry later");
+    }
+
     @Override
     public String toString() {
         return "ClientReadResponse{success=" + success + ", key='" + key + "', value='" + value + "'}";

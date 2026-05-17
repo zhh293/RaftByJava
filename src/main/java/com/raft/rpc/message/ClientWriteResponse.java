@@ -30,6 +30,10 @@ public class ClientWriteResponse extends RpcMessage {
         return new ClientWriteResponse(false, leaderHint, null);
     }
 
+    public static ClientWriteResponse noLeader() {
+        return new ClientWriteResponse(false, null, "NO_LEADER: cluster is electing, please retry later");
+    }
+
     @Override
     public String toString() {
         return "ClientWriteResponse{success=" + success + ", leaderHint='" + leaderHint + "', result='" + result + "'}";

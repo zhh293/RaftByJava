@@ -9,9 +9,12 @@ import java.util.Map;
 public class NodeState {
     private final String nodeId;
 
-    // Persistent state (would be written to disk in production)
+    // Persistent state (written to disk via PersistenceManager)
     private int currentTerm = 0;
     private String votedFor = null;
+
+    // Optional persistence callback
+    private PersistenceManager persistenceManager;
 
     // Role
     private volatile NodeRole role = NodeRole.FOLLOWER;
@@ -27,13 +30,33 @@ public class NodeState {
         this.nodeId = nodeId;
     }
 
+    /**
+     * Set the persistence manager. When set, every setCurrentTerm/setVotedFor
+     * call will automatically flush state to disk.
+     */
+    public void setPersistenceManager(PersistenceManager pm) {
+        this.persistenceManager = pm;
+    }
+
     // --- term ---
     public int getCurrentTerm() { return currentTerm; }
-    public void setCurrentTerm(int currentTerm) { this.currentTerm = currentTerm; }
+    public void setCurrentTerm(int currentTerm) {
+        this.currentTerm = currentTerm;
+        persistMeta();
+    }
 
     // --- votedFor ---
     public String getVotedFor() { return votedFor; }
-    public void setVotedFor(String votedFor) { this.votedFor = votedFor; }
+    public void setVotedFor(String votedFor) {
+        this.votedFor = votedFor;
+        persistMeta();
+    }
+
+    private void persistMeta() {
+        if (persistenceManager != null) {
+            persistenceManager.saveMeta(currentTerm, votedFor);
+        }
+    }
 
     // --- role ---
     public NodeRole getRole() { return role; }

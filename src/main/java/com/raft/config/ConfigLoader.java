@@ -15,7 +15,7 @@ public class ConfigLoader {
     }
 
     private static void validate(RaftConfig config) {
-        if (config.getNodeId() == null || config.getNodeId().isBlank()) {
+        if (config.getNodeId() == null || config.getNodeId().trim().isEmpty()) {
             throw new IllegalArgumentException("nodeId must not be blank");
         }
         if (config.getPeers() == null || config.getPeers().isEmpty()) {

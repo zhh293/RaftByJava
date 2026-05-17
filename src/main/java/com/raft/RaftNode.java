@@ -29,6 +29,9 @@ public class RaftNode {
     private StateMachine stateMachine;
     private TimerManager timerManager;
     private RaftCore raftCore;
+    private PersistenceManager persistenceManager;
+    private SnapshotManager snapshotManager;
+    private ClientSessionTable sessionTable;
 
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
 
@@ -39,44 +42,93 @@ public class RaftNode {
     public void start() throws Exception {
         log.info("Node {} starting on {}:{}", config.getNodeId(),
                 config.getListenHost(), config.getListenPort());
-        log.info("Cluster size: {}, majority count: {}",
-                config.getClusterSize(), config.getMajorityCount());
+        log.info("Cluster size: {}, majority count: {}", config.getClusterSize(), config.getMajorityCount());
+        log.info("Data directory: {}", config.getDataDir());
 
         // 1. Create the Raft core thread (single-threaded executor)
         raftExecutor = Threads.singleThreadScheduledExecutor("raft-core-" + config.getNodeId());
 
-        // 2. Create core components
-        nodeState = new NodeState(config.getNodeId());
-        logManager = new LogManager();
-        stateMachine = new StateMachine();
+        // 2. Create persistence manager
+        persistenceManager = new PersistenceManager(config.getDataDir());
 
-        // 3. Create Netty infrastructure
+        // 3. Create core components
+        nodeState = new NodeState(config.getNodeId());
+        nodeState.setPersistenceManager(persistenceManager);
+
+        logManager = new LogManager();
+        logManager.setPersistenceManager(persistenceManager);
+
+        stateMachine = new StateMachine();
+        sessionTable = new ClientSessionTable();
+
+        // 4. Create snapshot manager
+        snapshotManager = new SnapshotManager(
+                persistenceManager.getDataDir(), config.getSnapshotThreshold());
+
+        // 5. Recover from persistence
+        recoverFromDisk();
+
+        // 6. Create Netty infrastructure
         nettyClient = new RaftNettyClient(null); // handler will be set after creation
         nettyClient.start();
 
         peerManager = new PeerConnectionManager(config.getNodeId(), nettyClient);
         messageHandler = new RaftMessageHandler(peerManager, raftExecutor);
 
-        // 4. Create timer manager (uses the raft executor for callbacks)
+        // 7. Create timer manager (uses the raft executor for callbacks)
         timerManager = new TimerManager(raftExecutor, config);
 
-        // 5. Create RaftCore — the heart of the system
-        raftCore = new RaftCore(config, nodeState, logManager, stateMachine, timerManager, peerManager);
+        // 8. Create RaftCore — the heart of the system
+        raftCore = new RaftCore(config, nodeState, logManager, stateMachine,
+                timerManager, peerManager, snapshotManager, sessionTable);
 
-        // 6. Wire the delegate back to the handler
+        // 9. Wire the delegate back to the handler
         messageHandler.setCoreDelegate(raftCore);
 
-        // 7. Start Netty server
+        // 10. Start Netty server
         nettyServer = new RaftNettyServer(config.getListenHost(), config.getListenPort(), messageHandler);
         nettyServer.start();
 
-        // 8. Connect to peers (async, non-blocking)
+        // 11. Connect to peers (async, non-blocking)
         peerManager.connectToPeers(config.getOtherPeers());
 
-        // 9. Initialize Raft core (set follower, start election timer)
+        // 12. Initialize Raft core (set follower, start election timer)
         raftExecutor.execute(raftCore::initialize);
 
         log.info("Node {} started successfully", config.getNodeId());
+    }
+
+    /**
+     * Recover persisted state from disk:
+     * 1. Load snapshot if available (restore state machine)
+     * 2. Load WAL entries (replay committed entries after snapshot)
+     * 3. Load meta (currentTerm + votedFor)
+     */
+    private void recoverFromDisk() {
+        // Load snapshot first
+        boolean hasSnapshot = snapshotManager.loadSnapshot();
+        if (hasSnapshot) {
+            stateMachine.restoreFromSnapshot(snapshotManager.getLastSnapshotData());
+            logManager.applySnapshot(
+                    snapshotManager.getLastIncludedIndex(),
+                    snapshotManager.getLastIncludedTerm());
+            log.info("Recovered snapshot: lastIndex={}, lastTerm={}",
+                    snapshotManager.getLastIncludedIndex(),
+                    snapshotManager.getLastIncludedTerm());
+        }
+
+        // Load WAL entries
+        logManager.loadFromDisk();
+        log.info("Recovered {} log entries from WAL", logManager.size());
+
+        // Load meta
+        PersistenceManager.MetaData meta = persistenceManager.loadMeta();
+        if (meta != null) {
+            // Set directly to avoid re-persisting what we just loaded
+            nodeState.setCurrentTerm(meta.getCurrentTerm());
+            nodeState.setVotedFor(meta.getVotedFor());
+            log.info("Recovered meta: term={}, votedFor={}", meta.getCurrentTerm(), meta.getVotedFor());
+        }
     }
 
     public void shutdown() {

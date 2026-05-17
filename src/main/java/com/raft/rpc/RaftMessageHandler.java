@@ -62,10 +62,20 @@ public class RaftMessageHandler extends SimpleChannelInboundHandler<RpcMessage> 
             coreDelegate.onRequestVoteRequest((RequestVoteRequest) msg, channel);
         } else if (msg instanceof RequestVoteResponse) {
             coreDelegate.onRequestVoteResponse((RequestVoteResponse) msg);
+        } else if (msg instanceof PreVoteRequest) {
+            coreDelegate.onPreVoteRequest((PreVoteRequest) msg, channel);
+        } else if (msg instanceof PreVoteResponse) {
+            coreDelegate.onPreVoteResponse((PreVoteResponse) msg);
+        } else if (msg instanceof InstallSnapshotRequest) {
+            coreDelegate.onInstallSnapshotRequest((InstallSnapshotRequest) msg, channel);
+        } else if (msg instanceof InstallSnapshotResponse) {
+            coreDelegate.onInstallSnapshotResponse((InstallSnapshotResponse) msg);
         } else if (msg instanceof ClientWriteRequest) {
             coreDelegate.onClientWriteRequest((ClientWriteRequest) msg, channel);
         } else if (msg instanceof ClientReadRequest) {
             coreDelegate.onClientReadRequest((ClientReadRequest) msg, channel);
+        } else if (msg instanceof MembershipChangeRequest) {
+            coreDelegate.onMembershipChangeRequest((MembershipChangeRequest) msg, channel);
         } else {
             log.warn("Unknown message type: {}", msg.getClass().getSimpleName());
         }
@@ -90,7 +100,12 @@ public class RaftMessageHandler extends SimpleChannelInboundHandler<RpcMessage> 
         void onAppendEntriesResponse(AppendEntriesResponse response);
         void onRequestVoteRequest(RequestVoteRequest request, Channel channel);
         void onRequestVoteResponse(RequestVoteResponse response);
+        void onPreVoteRequest(PreVoteRequest request, Channel channel);
+        void onPreVoteResponse(PreVoteResponse response);
+        void onInstallSnapshotRequest(InstallSnapshotRequest request, Channel channel);
+        void onInstallSnapshotResponse(InstallSnapshotResponse response);
         void onClientWriteRequest(ClientWriteRequest request, Channel channel);
         void onClientReadRequest(ClientReadRequest request, Channel channel);
+        void onMembershipChangeRequest(MembershipChangeRequest request, Channel channel);
     }
 }
