@@ -154,3 +154,345 @@ Vertical Paxos 的核心观点——"读写 quorum 分离"和"配置管理外提
 你不需要懂拉格朗日力学也能用牛顿力学解题。但懂了之后，你对整个力学世界的理解深度完全不一样——你知道哪些是本质的、哪些是可以变的、哪些看似不同的系统其实是同一回事。
 
 读完这两篇文章的正确感受就是：Raft 不再是一个"记住规则就行"的算法，而是一个你真正理解了设计动机的系统。
+
+---
+
+## 七、从 Vertical Paxos 推导 Multi-Raft：完整推理过程
+
+> Vertical Paxos 论文本身没有写"Multi-Raft"三个字（论文是 2009 年的，TiKV 是 2016 年之后的工程），但 Multi-Raft 的每一个核心架构决策，都可以从 Vertical Paxos 的理论框架里一步一步推导出来。下面就是完整的推理链条。
+
+---
+
+### 架构对比图：单 Raft vs Multi-Raft
+
+先通过两张图直观感受一下，单 Raft 架构和 Multi-Raft 架构到底长什么样、差在哪里：
+
+**单 Raft 架构（一个 Group 管所有数据）：**
+
+```
+                         ┌─────────────────────────────────────┐
+                         │           客户端请求                  │
+                         └──────────────────┬──────────────────┘
+                                            │ 所有读写都压到一个 Leader
+                                            ▼
+                    ┌───────────────────────────────────────────────┐
+                    │              唯一的 Raft Group                  │
+                    │                                               │
+                    │   ┌─────────┐   ┌─────────┐   ┌─────────┐   │
+                    │   │ Node A  │   │ Node B  │   │ Node C  │   │
+                    │   │(Leader) │──▶│(Follower)│   │(Follower)│   │
+                    │   │         │──▶│         │   │         │   │
+                    │   │ 全量数据 │   │ 全量数据 │   │ 全量数据 │   │
+                    │   │ [a～z)  │   │ [a～z)  │   │ [a～z)  │   │
+                    │   └─────────┘   └─────────┘   └─────────┘   │
+                    │                                               │
+                    └───────────────────────────────────────────────┘
+
+  瓶颈：单 Leader 串行处理所有写入，存储无法水平扩展，加机器只能提高容灾
+```
+
+**Multi-Raft 架构（数据分片，多个 Group 并行）：**
+
+```
+                         ┌─────────────────────────────────────┐
+                         │           客户端请求                  │
+                         └───┬──────────────┬──────────────┬───┘
+                             │              │              │
+                   key∈[a,m) │    key∈[m,t) │    key∈[t,z) │
+                             ▼              ▼              ▼
+ ┌─────────────────────────────────────────────────────────────────────────┐
+ │                                                                         │
+ │  ┌─ Region-1 ──────┐   ┌─ Region-2 ──────┐   ┌─ Region-3 ──────┐     │
+ │  │  数据范围[a, m)   │   │  数据范围[m, t)   │   │  数据范围[t, z)   │     │
+ │  │                  │   │                  │   │                  │     │
+ │  │ Node-A (Leader)  │   │ Node-B (Leader)  │   │ Node-C (Leader)  │     │
+ │  │ Node-B (Follower)│   │ Node-C (Follower)│   │ Node-A (Follower)│     │
+ │  │ Node-D (Follower)│   │ Node-A (Follower)│   │ Node-D (Follower)│     │
+ │  └──────────────────┘   └──────────────────┘   └──────────────────┘     │
+ │                                                                         │
+ └─────────────────────────────────────────────────────────────────────────┘
+                             │
+           ┌─────────────────┼─────────────────┐
+           │                 │                 │
+           ▼                 ▼                 ▼
+    ┌────────────┐    ┌────────────┐    ┌────────────┐
+    │   Node-A   │    │   Node-B   │    │   Node-C   │    ┌────────────┐
+    │ R1-Follower│    │ R1-Leader  │    │ R2-Follower│    │   Node-D   │
+    │ R2-Follower│    │ R2-Leader  │    │ R3-Leader  │    │ R1-Follower│
+    │ R3-Follower│    │            │    │            │    │ R3-Follower│
+    └────────────┘    └────────────┘    └────────────┘    └────────────┘
+
+  优势：3 个 Leader 并行处理写入，数据分散存储可水平扩展
+  关键：Leader 打散在不同机器上，负载均衡
+```
+
+**加上 PD 的完整 Multi-Raft 全景图：**
+
+```
+                    ┌──────────────────────────────────┐
+                    │     PD Cluster（3节点 Raft）       │
+                    │                                  │
+                    │  · 存储全局元数据（哪个Region在哪） │
+                    │  · 分配 Region ID / Peer ID       │
+                    │  · 收集心跳 → 感知负载和健康       │
+                    │  · 下发调度指令：                  │
+                    │    - 加副本 / 删副本               │
+                    │    - Transfer Leader              │
+                    │    - Split / Merge                │
+                    └───────────────┬──────────────────┘
+                                    │ 调度指令（非数据路径）
+              ┌─────────────────────┼─────────────────────┐
+              ▼                     ▼                     ▼
+     ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
+     │   TiKV-1    │      │   TiKV-2    │      │   TiKV-3    │
+     │             │      │             │      │             │
+     │ Region-1(L) │◀────▶│ Region-1(F) │◀────▶│ Region-1(F) │
+     │ Region-2(F) │◀────▶│ Region-2(L) │◀────▶│ Region-2(F) │
+     │ Region-3(F) │◀────▶│ Region-3(F) │◀────▶│ Region-3(L) │
+     │ Region-4(L) │◀────▶│ Region-4(F) │◀────▶│ Region-4(F) │
+     │     ...     │      │     ...     │      │     ...     │
+     └─────────────┘      └─────────────┘      └─────────────┘
+              │                                         │
+              │        ┌─────────────┐                 │
+              └───────▶│  TiFlash    │◀────────────────┘
+                       │ (Learner)   │
+                       │ 列存副本     │
+                       │ 不参与投票   │
+                       │ 服务OLAP查询 │
+                       └─────────────┘
+
+  数据路径：客户端 → TiKV 节点（直接读写对应 Region 的 Leader）
+  控制路径：PD ← TiKV 心跳上报 / PD → TiKV 调度指令
+  两条路径完全分离，PD 不在数据读写的关键路径上
+```
+
+有了这三张图的直观印象，下面来看为什么 Multi-Raft 的每个部件都能从 Vertical Paxos 推导出来：
+
+---
+
+### 第一步：从"一个共识实例"到"大量并行实例"——为什么要分片
+
+**出发点：** Vertical Paxos 论文在背景部分有一句非常关键的话——
+
+> "真实的大规模系统，通常由大量的 replica group 组成，每组负责一小片数据。每组内部用某种共识协议保持一致。系统有充裕的空闲服务器用于重配置和部署新副本。"
+
+翻译成大白话就是：没有哪个正经的工业系统会让整个集群只跑一个 Paxos/Raft 实例。数据量一大、请求量一大，你必然要把数据切成很多片，每一片单独跑一个共识组。
+
+**推理过程：**
+
+一个 Raft Group 只有一个 Leader，所有写操作串行通过这一个 Leader。假设你有 1TB 数据、每秒 10 万次写请求，单 Leader 不可能扛住——CPU、网络、磁盘都是瓶颈。而且所有副本存的是完全相同的数据，加机器只能提高容灾能力，不能扩展存储容量。
+
+自然的结论：**把数据切成 N 片，每片独立跑一个 Raft Group，就有 N 个 Leader 可以并行处理写入。** 这就是 Multi-Raft 最朴素的出发点。
+
+到这一步为止，还不需要 Vertical Paxos 的理论——任何人都能想到"分片 + 并行"。
+
+但问题紧接着就来了：**分片之后，每片的节点集合不可能永远不变。** 机器会宕机、需要扩容、需要负载均衡。你必须能在不停服的情况下，动态增减每个分片的成员。这个"动态增减成员"的问题，就是 Vertical Paxos 的核心战场——reconfiguration。
+
+**结论：** 分片本身是朴素的工程决策，但分片之后的"每片怎么安全地换成员"，需要 Vertical Paxos 的理论来支撑。
+
+---
+
+### 第二步：从"Configuration Master"到"PD（Placement Driver）"
+
+**出发点：** Vertical Paxos 的一个核心创新——引入外部配置主控 Master。
+
+论文原话的意思是：不要让每个共识组自己决定怎么重配置，而是引入一个更高层的全局管理者来统一协调。这个 Master 负责：决定每个 ballot 的配置是什么（谁是 Leader、谁是 Acceptor）、分配 ballot number、协调重配置的时机。Master 自身也用复制状态机来实现（保证高可用）。
+
+**推理过程：**
+
+现在假设你有上万个 Raft Group（Region），每个都可能随时需要重配置。问几个问题：
+
+- 某台机器宕机了，上面 100 个 Region 的副本都少了一个。补副本补到哪台机器上？总不能让每个 Region 自己决定吧——万一 100 个 Region 都选了同一台空闲机器，那台机器瞬间过载。
+- 某台机器负载太高了，要把一些 Region 的 Leader 转走。转到哪里？转多少个？这需要全局视角——知道每台机器当前负载是多少。
+- 某个 Region 数据太大需要分裂。分裂后的两个新 Region 要不要分散到不同机器上？这也需要全局调度。
+
+这些问题都有一个共同特点：**需要全局信息才能做出好的决策，单个 Raft Group 自身不具备全局视角。**
+
+所以你需要一个集中的角色——它掌握全局的机器负载、Region 分布、副本数量等信息，然后统一下发调度指令。
+
+这就是 **PD（Placement Driver）** 的来源。PD 就是 Vertical Paxos 里 Configuration Master 在"管上万个 Raft Group"场景下的工程实现。
+
+**对照表：**
+
+| Vertical Paxos 论文 | Multi-Raft 工程实现（TiKV） |
+|---------------------|---------------------------|
+| Configuration Master 决定每个 ballot 的配置 | PD 决定每个 Region 的副本分布和 Leader 位置 |
+| Master 分配 ballot number | PD 分配 Region ID、Peer ID |
+| Master 协调重配置时机 | PD 根据负载和健康状态下发调度指令 |
+| Master 自身用复制状态机实现 | PD 自身是一个 3 节点 Raft/etcd 集群 |
+| Master 不参与数据面的正常读写 | PD 不在数据读写路径上，只管元数据和调度 |
+
+---
+
+### 第三步：从"VP-II 的状态迁移时序"到"Raft Learner"
+
+**出发点：** Vertical Paxos II 的核心原则——**新配置必须先完成状态迁移（State Transfer），才能被激活参与共识。**
+
+先搬家，再接活。
+
+**推理过程：**
+
+PD 决定给 Region-5 在 Node-D 上加一个新副本。这个新副本一开始数据是空的——它需要从 Leader 那里同步可能几十 MB 甚至几百 MB 的历史数据。
+
+关键问题：**在这个新副本追赶数据的过程中，它能不能算入多数派（quorum）？**
+
+假设原来 Region-5 有 3 个副本（A、B、C），多数派 = 2。现在加了 D，变成 4 副本，多数派 = 3。但 D 还在追赶数据，可能随时卡住或者很慢。
+
+如果 D 已经被算入 quorum 了，那 Leader 要凑齐 3 个确认才能提交。万一 D 很慢，每次写入都被拖住了——本来 A、B 两个确认就够（旧配置下），现在非得等 D 也确认才行（新配置下），性能直接下降。
+
+更极端的情况：如果 D 在追赶过程中直接挂了，你凑不齐 3 票（A、B 给了，C 是 Leader 也给了，但多数派要 3 个 non-Leader？不对——Leader 也算，ABC 三个旧节点投票就够了……但是按 4 节点算多数派是 3，如果 D 挂了、B 也恰好挂了，就只剩 A 和 C，凑不齐 3 票，写入卡死），系统反而因为"加副本"这个操作变得更脆弱了。
+
+这就是为什么新副本**不能一上来就参与投票**。
+
+Vertical Paxos II 的理论告诉我们正确的做法：
+
+1. 新节点先以"非 active 配置成员"的身份存在——只同步数据，不参与决策
+2. 等数据追赶完毕后，由 Master（PD）正式将其"激活"——提升为正式的投票成员
+
+翻译成 Raft 的工程术语：
+
+1. 新节点先作为 **Learner** 加入——从 Leader 接收日志，但不参与投票、不计入多数派
+2. 等 Learner 的日志追赶到接近 Leader 的进度后
+3. PD 下发指令将 Learner **提升为 Voter**——从此它正式参与投票，多数派人数加一
+
+**完整的 VP-II 时序对照：**
+
+```
+VP-II 理论流程                              Multi-Raft 工程流程
+─────────────────────────────────────────────────────────────────
+① Master 决定新配置（但不激活）    →    ① PD 决定加副本到 Node-D
+② 新成员开始 State Transfer       →    ② Node-D 作为 Learner 开始同步日志/快照
+③ State Transfer 期间：                  ③ Learner 期间：
+   - 新成员不参与共识                      - 不参与投票
+   - 旧配置继续正常工作                    - 旧的 3 副本继续正常读写
+   - Master 不激活新配置                   - PD 不提升 Learner
+④ State Transfer 完成              →    ④ Learner 日志追赶到接近 Leader
+⑤ 新成员通知 Master："我准备好了"  →    ⑤ PD 检测到 Learner 已 ready
+⑥ Master 激活新配置               →    ⑥ PD 下发 ConfChange：Learner → Voter
+⑦ 旧配置退役（如果需要）          →    ⑦ PD 下发 RemovePeer 移除旧节点（如果需要）
+```
+
+---
+
+### 第四步：从"VP-I 的并行激活"到"Region Split"
+
+**出发点：** Vertical Paxos I 的核心原则——**新配置可以立即激活，状态迁移和服务推进并行进行。**
+
+先接活，再搬家。
+
+**推理过程：**
+
+Region Split 是一个非常特殊的"重配置"操作：一个 Raft Group 变成两个 Raft Group。但它有一个独特的性质——**不需要跨网络的数据迁移。**
+
+想想看：Region-1 管 [a, z)，现在要从 m 这个位置切一刀，变成 Region-1 管 [a, m) 和 Region-2 管 [m, z)。切之前数据就在本机上，切之后数据还在本机上——只是逻辑上分成了两个 Group 各自维护各自的 Raft 状态。物理上不需要搬任何一个字节的数据。
+
+既然不需要 State Transfer，那就没必要用 VP-II 的保守策略（先搬完再激活）。直接用 VP-I 的思路——**新配置立即激活**。
+
+具体流程：
+
+1. Region-1 的 Leader 发现数据量超过阈值（比如 96MB）
+2. Leader 选择一个中间 key（比如 m）作为分裂点
+3. Leader 把"在 m 处分裂"这个操作写成一条 Raft 日志，通过共识让所有副本一起执行
+4. 执行完毕后，同一台机器上就有了两个独立的 Raft Group，**立刻都可以对外服务**
+
+对应到 VP-I：
+- "新配置立即 active" = 分裂出来的两个 Region 立刻都能处理读写
+- "状态迁移可以后续再做" = 如果 PD 后续要把其中一个 Region 调度到其他机器上，那部分迁移才是真正的 State Transfer（走 Learner 机制，即 VP-II）
+
+所以 **Region Split 是 VP-I 和 VP-II 的组合**：
+- Split 操作本身 → VP-I 思路（无需迁移数据，立即生效）
+- Split 之后的跨机器调度 → VP-II 思路（先加 Learner 搬数据，搬完提升 Voter）
+
+---
+
+### 第五步：从"Read/Write Quorum 分离"到"Multi-Raft 的读策略菜单"
+
+**出发点：** Vertical Paxos 的核心 trade-off——Read Quorum 越小，读越快；Write Quorum 越大，写越安全但越慢。两者的乘积受约束。
+
+**推理过程：**
+
+在 Multi-Raft 体系里，每个 Region 都是一个独立的 Raft Group。对于每个 Group，你可以独立地选择"读策略"——本质上就是在选择 Read Quorum 的大小。
+
+**选择一：Read Quorum = 多数派 → ReadIndex**
+
+Leader 每次处理读请求前，向多数派发一轮心跳确认自己还是 Leader。只有多数派回复了，才说明"我还是 Leader，我的数据是最新的"。
+
+- 优点：绝对安全，不依赖时钟
+- 缺点：每次读都有一次网络往返开销
+
+**选择二：Read Quorum = 1（Leader 自己）→ Lease Read**
+
+Leader 知道"只要选举超时时间没到，就不可能有新 Leader 产生"。所以在 lease 期内，Leader 直接读自己本地状态机返回，不需要任何网络通信。
+
+- 优点：读性能极高，零网络开销
+- 缺点：依赖时钟准确性。如果时钟漂移导致 lease 判断错误，可能读到过期数据
+
+**选择三：Read Quorum = 1（任意节点）→ Follower Read**
+
+进一步放宽——如果 Follower 能确认自己的 appliedIndex 不落后于 Leader 的 commitIndex，它自己也能服务读请求。
+
+- 优点：读负载分散到所有副本，不再只压 Leader
+- 缺点：Follower 需要先问一下 Leader 当前 commitIndex 是多少
+
+**选择四：Read Quorum 和 Write Quorum 解耦给不同消费者 → TiFlash**
+
+TiFlash 是 TiKV 的列存扩展，作为 Raft Learner 异步接收日志。对 TiFlash 来说：
+- 它不参与 Write Quorum（不影响写入性能）
+- 它自己就能构成 Read Quorum = 1（OLAP 查询直接读 TiFlash 本地，只要校对 Raft Index 保证数据足够新）
+
+这等于在**同一个 Raft Group 里，对不同的消费者使用了不同的 quorum 配置**——OLTP 走 Voter（标准 quorum），OLAP 走 Learner（独立的宽松 quorum）。这种灵活性正是 Read/Write Quorum 分离理论开辟出来的设计空间。
+
+---
+
+### 第六步：从"Master 全局调度"到"PD 的调度策略"
+
+**出发点：** Vertical Paxos 论文说 Configuration Master "根据系统变化来计算 read 和 write b-quorum"，并且"动态添加元素到 Ballots"。
+
+**推理过程：**
+
+PD 作为 Multi-Raft 体系的 Configuration Master，它的全局调度策略本质上就是在回答 Vertical Paxos 的核心问题——"什么时候重配置、怎么重配置"：
+
+| PD 的调度行为 | VP 理论对应 |
+|-------------|-----------|
+| 某台机器宕机 → PD 给受影响的 Region 补副本 | Master 检测到配置异常 → 发起重配置 |
+| PD 选择一台空闲机器放新副本 | Master 决定新配置的 Acceptor 集合 |
+| PD 先加 Learner 再提升 Voter | VP-II：先 State Transfer 再激活 |
+| PD 做 Transfer Leader（把 Leader 转到另一个 Voter） | Master 在配置内更换 Leader |
+| PD 触发 Region Split | VP-I：新配置立即生效（本地操作无需迁移） |
+| PD 触发 Region Merge | 两个独立配置合并为一个配置（逆向 Split） |
+| PD 做热点打散（Split + 调度） | VP-I + VP-II 组合 |
+
+PD 的每一种调度操作，都可以被理解为 Vertical Paxos 框架下的某种 reconfiguration 动作。
+
+---
+
+### 第七步：把整条推导链串起来
+
+```
+                    Vertical Paxos 理论框架
+                           │
+          ┌────────────────┼────────────────┐
+          │                │                │
+    读写Quorum分离     外部Master       重配置安全性
+          │                │                │
+          ▼                ▼                ▼
+  ┌───────────────┐  ┌──────────┐  ┌──────────────────┐
+  │ 读策略菜单     │  │   PD     │  │ Learner + Voter  │
+  │ ·ReadIndex    │  │ ·元数据   │  │ ·加副本先Learner │
+  │ ·Lease Read   │  │ ·调度    │  │ ·追赶完提升Voter │
+  │ ·Follower Read│  │ ·故障恢复│  │ ·Split立即生效   │
+  │ ·TiFlash      │  │ ·Split   │  │ ·Merge协调退役   │
+  └───────────────┘  └──────────┘  └──────────────────┘
+          │                │                │
+          └────────────────┼────────────────┘
+                           │
+                           ▼
+                    Multi-Raft 完整架构
+                   （TiKV / CockroachDB）
+```
+
+**用一段话说清楚：**
+
+Vertical Paxos 提供了三个理论工具——读写 Quorum 分离、外部 Configuration Master、以及 VP-I/VP-II 两种重配置时序。Multi-Raft 就是把这三个工具在"大规模分布式数据库"这个场景下全部用上的结果：数据分片产生了上万个独立的 Raft Group；PD 作为外部 Master 统一管理所有 Group 的配置；每个 Group 的成员变更遵循 VP-II 的"先搬状态再激活"时序（Learner 机制）；Split 操作遵循 VP-I 的"先激活再搬状态"时序（本地操作无需迁移）；读策略则是在 Read Quorum 参数空间里根据场景选不同的点。
+
+**Multi-Raft 不是某个工程师"拍脑袋"设计出来的新架构，而是 Vertical Paxos 理论在"大规模 + 高吞吐 + 强一致"这组工程约束下的必然展开形式。** 每一个架构决策——PD 为什么存在、Learner 为什么不投票、Split 为什么能立即生效、TiFlash 为什么不影响写性能——追根到底都是 Vertical Paxos 里某个理论概念的工程兑现。
