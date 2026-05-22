@@ -259,6 +259,18 @@ protected synchronized void doExport(RegisterTypeEnum registerType) {
 
 ### 3.3 doExportUrls() —— 注册 ProviderModel + 遍历协议
 
+> **这一步在干什么？**
+>
+> 前面 3.1 和 3.2 只是做了"能不能导出"的判断（配置合法性、是否已导出、是否延迟）。到了 3.3，才真正开始**准备导出所需的所有材料**。你可以把它理解成"出发前的打包"——告诉 Dubbo 框架"我有一个什么服务、它在哪些注册中心注册、用哪些协议暴露"。
+>
+> **做了什么事情？**
+> 1. 把你的服务接口信息（有哪些方法、方法签名）注册到一个全局仓库里，后续收到 RPC 请求时能根据 serviceKey 找到对应的服务
+> 2. 创建一个 `ProviderModel`——可以理解为你的服务在 Dubbo 内部的"身份证"，记录了"这个服务是谁、实现类是谁、接口长什么样"
+> 3. 加载你配置的所有注册中心地址（比如 Nacos 在哪、Zookeeper 在哪）
+> 4. 遍历你配置的所有协议（dubbo、tri），对每个协议分别走一遍完整的暴露流程
+>
+> **为什么需要这步？** 因为后面的步骤需要知道三个关键信息：服务元数据（方法签名等）、注册中心地址列表、协议列表。这一步就是把这三样东西准备好，交给下游。
+
 ```java
 private void doExportUrls(RegisterTypeEnum registerType) {
     ModuleServiceRepository repository = getScopeModel().getServiceRepository();
@@ -291,6 +303,16 @@ private void doExportUrls(RegisterTypeEnum registerType) {
 
 ### 3.4 doExportUrlsFor1Protocol() —— 构建服务 URL
 
+> **这一步在干什么？**
+>
+> 3.3 遍历每个协议时，会对每个协议调用这个方法。这一步的任务就一个：**把你的服务配置拼成一个 URL 字符串。**
+>
+> **为什么要搞成 URL？** 这是 Dubbo 的一个核心设计——在 Dubbo 内部，**所有信息都用 URL 来传递**。一个 URL 里包含了：用什么协议（dubbo/tri）、服务部署在哪台机器的哪个端口、接口名是什么、超时时间多少、重试几次等等。后续所有层拿到这个 URL 就知道该怎么处理了，不需要额外传一堆参数。
+>
+> **类比：** 就像你写一个 HTTP 请求 `http://192.168.1.100:8080/api/user?timeout=3000`，URL 本身就携带了"去哪里、找什么、怎么配置"的全部信息。Dubbo 的 URL 也是这个思路，只是协议头不是 http 而是 dubbo/tri。
+>
+> **做完之后：** 拿着这个拼好的 URL，进入下一步 `exportUrl()`，决定这个服务是本地暴露还是远程暴露。
+
 ```java
 private void doExportUrlsFor1Protocol(
         ProtocolConfig protocolConfig, List<URL> registryURLs, RegisterTypeEnum registerType) {
@@ -312,6 +334,18 @@ private void doExportUrlsFor1Protocol(
 ```
 
 ### 3.5 exportUrl() —— 决定本地暴露还是远程暴露
+
+> **这一步在干什么？**
+>
+> 3.4 把 URL 拼好了，现在要决定一个问题：**这个服务要暴露给谁用？**
+>
+> 有两种暴露方式：
+> - **本地暴露（exportLocal）**：给同一个 JVM 里的消费者用。比如你的项目里既有 UserService 的实现，又有另一个模块调用 UserService——这时候走内存调用就行了，不用走网络，快得多。
+> - **远程暴露（exportRemote）**：给其他机器上的消费者用。这才是真正要开端口、注册到 Nacos 的那条路。
+>
+> **为什么要分这两种？** 性能优化。如果调用方和提供方在同一个进程里，还走网络序列化反序列化一遍纯属浪费。本地暴露走 `injvm://` 协议，直接在内存里调用，延迟几乎为零。
+>
+> **默认行为：** 如果你没配 `scope` 参数，Dubbo 会**两种都做**——既做本地暴露（万一同 JVM 有消费者），又做远程暴露（给外部消费者）。
 
 ```java
 private void exportUrl(URL url, List<URL> registryURLs, RegisterTypeEnum registerType) {
@@ -337,11 +371,15 @@ private void exportUrl(URL url, List<URL> registryURLs, RegisterTypeEnum registe
 }
 ```
 
-**默认行为**：scope 为空时，**同时做本地暴露和远程暴露**。
-
 ### 3.6 exportLocal() —— 本地暴露（JVM 内部调用优化）
 
-本地暴露的目的是：当同一个 JVM 内既有 Provider 又有 Consumer 时，调用走 JVM 内部直接调用，不走网络。
+> **这一步在干什么？**
+>
+> 就是把 3.4 拼好的那个 URL（比如 `dubbo://192.168.1.100:20880/UserService?...`）**改头换面**——协议从 `dubbo` 改成 `injvm`，host 改成 `127.0.0.1`，端口改成 `0`。然后用这个改造后的 URL 去调 `doExportUrl()`。
+>
+> **为什么这么做？** 因为后面 `doExportUrl()` 里会根据 URL 的协议头来决定走哪个 Protocol 实现。协议头是 `injvm` 的话，就会走 `InjvmProtocol`——这个 Protocol 不会开任何网络端口，只是在内存里注册一下，同 JVM 的消费者直接从内存里找到这个 Invoker 就行了。
+>
+> **这步做完之后：** 本地暴露就结束了。简单、快速、不涉及网络。接下来 3.5 那个 if 判断会继续走远程暴露的逻辑。
 
 ```java
 private void exportLocal(URL url) {
@@ -355,6 +393,18 @@ private void exportLocal(URL url) {
 ```
 
 ### 3.7 exportRemote() —— 远程暴露（核心路径）
+
+> **这一步在干什么？**
+>
+> 远程暴露意味着：你的服务要能被**其他机器上的进程**通过网络调用到。要实现这个目标，需要做两件事：
+> 1. 在本机开一个网络端口，监听 RPC 请求
+> 2. 把"我在哪个 IP、哪个端口、提供什么服务"这个信息注册到注册中心（Nacos/Zookeeper），这样消费者才能找到你
+>
+> **这步做了一个很精妙的操作：URL 套娃。** 它不是直接拿着 `dubbo://192.168.1.100:20880/UserService` 去调 `doExportUrl`，而是把这个 URL **塞进了** `registry://127.0.0.1:8848/...` 这个注册中心 URL 的属性里。
+>
+> **为什么要套娃？** 因为 Dubbo 的 SPI 路由机制是看 URL 协议头的。如果传 `dubbo://` 进去，就直接走 `DubboProtocol` 开端口了，不会注册到 Nacos。但是传 `registry://` 进去，就会先走 `RegistryProtocol`——这个 Protocol 会**先帮你开端口（从属性里取出真正的 dubbo:// URL），再帮你注册到注册中心**。一箭双雕。
+>
+> **如果没有注册中心呢？** 那就直连模式，直接传 `dubbo://` URL 去调 `doExportUrl`，只开端口不注册。消费者需要手动配置你的地址才能调到你。
 
 ```java
 private URL exportRemote(URL url, List<URL> registryURLs, RegisterTypeEnum registerType) {
@@ -373,11 +423,29 @@ private URL exportRemote(URL url, List<URL> registryURLs, RegisterTypeEnum regis
 }
 ```
 
-**关键设计**：有注册中心时，传给 `doExportUrl` 的 URL 是 `registry://...` 协议的，真正的 provider URL（如 `dubbo://...`）被放在了 `EXPORT_KEY` 属性里。这样 Protocol SPI 自适应机制就会路由到 `RegistryProtocol`。
-
 ### 3.8 doExportUrl() —— 创建 Invoker + 调用 Protocol.export()
 
-**这是整个暴露流程中最关键的一步**，做了两件大事：
+> **这一步在干什么？这是整个第三阶段的终点，也是最关键的一步。**
+>
+> 前面所有步骤都是准备工作：3.3 准备了材料（元数据、注册中心列表、协议列表），3.4 拼好了 URL，3.5 决定了暴露方式，3.6/3.7 做了 URL 的变形。到了 3.8，终于要**真正动手了**。
+>
+> **这步做了两件大事：**
+>
+> **第一件：把你的 `UserServiceImpl` 包装成 `Invoker`。**
+>
+> 问题是：Dubbo 框架下面那些层（Protocol、Exchange、Transport）不认识你的 `UserServiceImpl`，它们只认识一个统一的接口——`Invoker`。`Invoker` 就是一个"我能帮你调某个方法"的抽象。所以这里用 `proxyFactory.getInvoker()` 把你的实现类包装了一层。包装完之后，不管你的接口有多少方法、方法签名是什么，对框架来说都变成了统一的 `invoker.invoke(invocation)` 调用。
+>
+> 通俗比喻：你写了一个会做菜的厨师（UserServiceImpl），但餐厅的点单系统只认识标准化的"工位"接口（Invoker）。你需要让厨师坐到工位上，这样点单系统就能统一派单了。
+>
+> **第二件：把包装好的 Invoker 交给 Protocol 层去"暴露"。**
+>
+> `protocolSPI.export(invoker)` 这一行是**整个流程的分水岭**——从这里开始，控制权从 Config 层（配置编排）交给了 Protocol 层（网络协议处理）。Protocol 层会根据 URL 协议头做不同的事：
+> - `registry://` → 走 `RegistryProtocol`：先委托底层协议开端口，再注册到注册中心
+> - `dubbo://` → 走 `DubboProtocol`：启动 Netty Server，监听端口
+> - `tri://` → 走 `TripleProtocol`：启动 HTTP/2 Server，监听端口
+> - `injvm://` → 走 `InjvmProtocol`：什么网络都不开，直接在内存里注册
+>
+> **做完这步之后：** Config 层的活就全干完了。后面第四、五、六、七、八、九阶段都是 Protocol 层和更底下的层在干活。
 
 ```java
 private void doExportUrl(URL url, boolean withMetaData, RegisterTypeEnum registerType) {
