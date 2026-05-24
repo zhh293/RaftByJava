@@ -468,6 +468,137 @@ private <T> ClusterInvoker<T> doCreateInvoker(
 }
 ```
 
+### 3.4 串联回顾：ClusterInvoker 是怎么回到业务代码手里的？
+
+> **读到这里你可能一脸懵逼：`doCreateInvoker()` 返回了一个 ClusterInvoker，然后呢？它去哪了？业务代码又是怎么调用到它的？**
+>
+> 下面把完整的"返回链路"一步步串起来，让你看清楚从 `doCreateInvoker()` 返回到业务代码 `userService.findUser(1)` 之间到底发生了什么。
+
+#### 返回路径（从底向上）
+
+```
+doCreateInvoker() 返回 FailoverClusterInvoker
+        ↓ 返回给
+doRefer() 里的 getMigrationInvoker()，包装成 MigrationInvoker
+        ↓ 返回给
+RegistryProtocol.refer()
+        ↓ 返回给
+createInvoker() 里的 protocolSPI.refer()，赋值给 this.invoker 字段
+        ↓ 返回给
+createProxy()（继续往下走第 3 步）
+        ↓
+proxyFactory.getProxy(invoker)  →  生成 JDK 动态代理对象
+        ↓ 返回给
+ReferenceConfig.init() 里的 ref = createProxy(...)
+        ↓
+ref 就是那个 JDK 代理对象，它被注入到你的 @DubboReference 字段里
+```
+
+#### 用人话说清楚整个过程
+
+**第一步：`doCreateInvoker()` 返回 ClusterInvoker**
+
+`cluster.join(directory, true)` 返回一个 `FailoverClusterInvoker`，它内部持有 `RegistryDirectory`（包含所有 Provider 的 DubboInvoker 列表）。
+
+**第二步：一路向上返回到 `createInvoker()`**
+
+`doCreateInvoker()` → `doRefer()` → `RegistryProtocol.refer()` → 回到 `createInvoker()` 里的这一行：
+
+```java
+// createInvoker() 里
+invoker = protocolSPI.refer(interfaceClass, curUrl);  // 返回的就是那个 ClusterInvoker
+```
+
+此时 `this.invoker` 字段已经拿到了 ClusterInvoker。
+
+**第三步：`createProxy()` 用这个 Invoker 生成 JDK 动态代理**
+
+回忆 `createProxy()` 的代码：
+
+```java
+private T createProxy(Map<String, String> referenceParameters) {
+    aggregateUrlFromRegistry(referenceParameters);
+    createInvoker();  // ← 执行完后 this.invoker = ClusterInvoker
+    // ↓ 用 invoker 生成代理对象
+    return (T) proxyFactory.getProxy(invoker, isGeneric(genericType));
+}
+```
+
+`proxyFactory.getProxy(invoker)` 内部做的事情很简单——生成一个 JDK 动态代理：
+
+```java
+// JavassistProxyFactory / JdkProxyFactory 的核心逻辑
+public <T> T getProxy(Invoker<T> invoker, boolean generic) {
+    Class<?>[] interfaces = new Class[]{invoker.getInterface(), EchoService.class, Destroyable.class};
+    return (T) Proxy.newProxyInstance(
+            classLoader,
+            interfaces,
+            new InvokerInvocationHandler(invoker)  // ← 关键！把 ClusterInvoker 放进去
+    );
+}
+```
+
+注意 `InvokerInvocationHandler`——它就是那个"增强方法"的来源。
+
+**第四步：代理对象赋值给 `ref`，注入到你的业务字段**
+
+```java
+// ReferenceConfig.init() 里
+ref = createProxy(referenceParameters);  // ref = JDK代理对象
+```
+
+而 Spring 容器在属性注入阶段，会把这个 `ref` 注入到你标了 `@DubboReference` 的字段：
+
+```java
+@DubboReference
+private UserService userService;  // ← 实际注入的是上面那个 JDK 代理对象
+```
+
+#### 业务代码调用时发生了什么？
+
+当你在业务代码里写 `userService.findUser(1)` 时，调用链如下：
+
+```
+userService.findUser(1)
+    ↓  （userService 是 JDK 代理对象）
+InvokerInvocationHandler.invoke(proxy, method, args)
+    ↓  （把方法名、参数封装成 RpcInvocation）
+ClusterInvoker.invoke(invocation)   // 即 FailoverClusterInvoker
+    ↓  （负载均衡选一个 Provider，失败则重试）
+DubboInvoker.invoke(invocation)
+    ↓  （通过 Netty 发 TCP 请求到 Provider）
+Provider 端执行业务逻辑，返回结果
+    ↓
+Result 沿调用链原路返回
+    ↓
+userService.findUser(1) 拿到返回值
+```
+
+`InvokerInvocationHandler` 的核心代码：
+
+```java
+public class InvokerInvocationHandler implements InvocationHandler {
+    private final Invoker<?> invoker;  // 就是那个 ClusterInvoker
+
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        // toString、hashCode、equals 等方法直接本地处理
+        if (method.getDeclaringClass() == Object.class) {
+            return method.invoke(invoker, args);
+        }
+
+        // 构建 RPC 调用上下文
+        RpcInvocation rpcInvocation = new RpcInvocation(
+                serviceModel, method, invoker.getInterface().getName(), args);
+
+        // 调用 ClusterInvoker.invoke()，触发负载均衡 → 网络调用 → 返回结果
+        return InvocationUtil.invoke(invoker, rpcInvocation);
+    }
+}
+```
+
+> **一句话总结**：`doCreateInvoker()` 返回的 ClusterInvoker 最终被塞进了一个 JDK 动态代理的 `InvokerInvocationHandler` 里。这个代理对象就是你 `@DubboReference` 注入的那个 `userService`。你调用 `userService` 的任何方法，都会被 `InvokerInvocationHandler` 拦截，转发给 ClusterInvoker，由它完成负载均衡、重试、网络通信的全过程。**不存在什么神秘的"增强"，就是最朴素的 JDK 动态代理 + InvocationHandler 拦截。**
+
 ---
 
 ## 第四阶段：服务发现 —— 从注册中心获取 Provider 列表并建立连接
@@ -1322,3 +1453,53 @@ public static Object invoke(Invoker<?> invoker, RpcInvocation rpcInvocation) thr
 ## 一句话串联全流程
 
 > Spring 扫描到你的 `@DubboReference` 字段，注册一个 `ReferenceBean`（FactoryBean）；Spring 注入时调用 `getObject()` 返回一个懒代理；第一次调用代理方法时触发 `ReferenceConfig.init()`——连接注册中心、订阅 Provider 列表、对每个 Provider 建立 Netty TCP 连接、用 Cluster 把所有连接聚合成一个带负载均衡和重试的 ClusterInvoker；后续每次方法调用通过 InvokerInvocationHandler 进入 Invoker 链，经过 Cluster（选节点+重试）→ Filter（切面）→ DubboInvoker（封装请求）→ HeaderExchangeChannel（创建 DefaultFuture + 发送）→ NettyClient（编码+网络发送）；响应返回时 Netty 收到字节流、解码、通过 requestId 匹配到 DefaultFuture 并 complete，最终 `recreate()` 把业务返回值交还给你的代码。
+
+---
+
+## 我眼里的 Dubbo
+
+### 消费者启动：从注解到可以发请求
+
+Spring 启动时分两步处理 `@DubboReference`。第一步是 `BeanFactoryPostProcessor` 阶段——扫描所有标了 `@DubboReference` 的字段，为每个引用注册一个 `ReferenceBean` 到容器里。第二步是 `InstantiationAwareBeanPostProcessor` 阶段（属性注入时）——把一个懒代理注入到你的字段里。这个懒代理的 `InvocationHandler` 里埋了一个 `targetSource.getTarget()` 的引子，此时不会触发任何 TCP 连接。
+
+当业务代码第一次调用代理方法时，`getTarget()` 触发 `ReferenceConfig.init()`，正式初始化开始。`init()` 里最核心的是 `createProxy()` 方法，它做两件事：先 `createInvoker()` 创建 Invoker 链，再用 `proxyFactory.getProxy(invoker)` 生成一个带 `InvokerInvocationHandler` 的 JDK 动态代理。这个代理对象就是你后续真正调用的那个 `userService`。
+
+### createInvoker：消费端最复杂的一步
+
+`createInvoker()` 内部根据 URL 协议头路由到 `RegistryProtocol.refer()`，然后一路下去：获取 Registry 实例 → 构建消费者 URL → 创建 `RegistryDirectory`。`RegistryDirectory` 实现了 `NotifyListener` 接口，它自己去 `subscribe` 注册中心。注册中心收到订阅后，立刻回调 `notify()` 推送当前所有 Provider URL。
+
+`notify()` 触发 `refreshInvoker()`——对每个 Provider URL 创建 `DubboInvoker`。创建之前要先拿到到那台机器的连接：`getSharedClient()` 以 `host:port` 为 key 查缓存，有就直接复用（引用计数+1），没有就 `initClient()` 建新连接。连接建立的调用链是 Exchanger → Transport → `doConnect()`（Netty `bootstrap.connect()`）。
+
+最后 `cluster.join(directory)` 把持有一组 DubboInvoker 的 Directory 包装成一个 `FailoverClusterInvoker`——带负载均衡和失败重试能力。这个 ClusterInvoker 一路返回，被塞进 `InvokerInvocationHandler`，最终就是你字段里那个代理对象的"内核"。
+
+### Exchange 层：一条连接，多个请求，靠 requestId 区分
+
+一条 TCP 连接上可以并发多个请求，响应回来的顺序是不确定的。怎么知道收到的响应对应哪个请求？答案是 **requestId**。
+
+`HeaderExchangeChannel.request()` 每次发请求时，用一个 AtomicLong 自增生成全局唯一的 requestId，然后以 `requestId → DefaultFuture` 存入全局 `FUTURES` map。请求带着这个 ID 发出去，Provider 处理完后把同样的 ID 塞进 Response 写回来。Consumer 端 Netty 收到响应、解码后，用 `response.getId()` 从 map 里精确找到对应的 `DefaultFuture`，调用 `complete()` 推进结果。
+
+这个设计模式和 HTTP/2 的 streamId 本质相同——在一条连接上多路复用，靠唯一 ID 区分不同的请求/响应对。区别在于 Dubbo 的 requestId 是应用层自己管的（DefaultFuture + ConcurrentHashMap），而 HTTP/2 的 streamId 是协议层帧格式内置的（由 Netty 的 `Http2FrameCodec` 自动管理）。如果你自己手撸一个多路复用网络框架，核心逻辑也一定是这样：发请求时生成唯一 ID，存 ID→Future 的 map，收到响应时按 ID 取出 Future 然后 complete。
+
+### 超时机制：HashedWheelTimer + Future
+
+`DefaultFuture` 创建时会用 `HashedWheelTimer`（时间轮）注册一个延迟任务。如果超时时间到了还没收到响应，时间轮触发检查，对 Future 调用 `completeExceptionally(new TimeoutException(...))`，同时从 `FUTURES` map 里移除（不会内存泄漏）。这个 TimeoutException 不是业务异常，所以 `FailoverClusterInvoker` 会 catch 住并重试下一个 Provider。
+
+### 重试机制：排除失败节点，重新选择
+
+`FailoverClusterInvoker` 重试时不是对同一个 Provider 再来一次，而是重新从 Directory 里通过负载均衡选一个新的。选择时会尽量排除掉已经调用失败的 Invoker（`invoked` 列表记录了哪些试过了）。另外重试之前还会重新调 `list(invocation)` 获取最新列表并经过 RouterChain 过滤，因为在重试间隙 Provider 列表可能已经变化了。业务异常（`e.isBiz() == true`）不重试，直接抛给调用者。
+
+### 异步本质：阻塞只发生在最外层
+
+Dubbo 内部从 DubboInvoker → Exchange → Netty 全链路都是异步的（CompletableFuture），没有任何一层主动 block。真正的阻塞点在最外层 `InvocationUtil.invoke()` 的 `.recreate()` 里——它调用了 `appResponseFuture.get()` 同步等待结果。这意味着如果你的接口返回类型改成 `CompletableFuture<User>`，框架就不会调 `.get()`，直接把 Future 透传给你，切异步几乎零成本。
+
+### 动态感知：不重启也能发现新 Provider
+
+`RegistryDirectory` 订阅注册中心之后，连接一直保持着。运行过程中新 Provider 上线注册到 Nacos/Zookeeper，注册中心主动推送变更通知，回调 `notify()` → `refreshInvoker()`。新旧列表对比：还在的 Invoker 直接复用，新增的创建 DubboInvoker 并建连，下线的调用 `destroy()` 关闭连接。整个过程对业务代码完全透明，无需重启。
+
+### 连接管理：共享 + 引用计数
+
+同一个 `host:port` 上的多个服务默认共享一条 TCP 连接（通过 requestId 多路复用）。`ReferenceCountExchangeClient` 维护引用计数——每多一个服务引用就 +1，取消引用就 -1，减到 0 才真正关闭底层 Netty Channel。这避免了"引用 100 个服务就建 100 条连接"的资源浪费。
+
+### IO 线程保护：AllChannelHandler 切线程
+
+Netty 收到响应后，不会直接在 IO 线程上做 `Future.complete()`。因为 `complete()` 会触发用户注册的回调链（`.thenApply()`、`.whenComplete()` 等），如果回调里有耗时操作就会阻塞 IO 线程，影响所有连接的读写。所以 `AllChannelHandler` 先把消息 dispatch 到业务线程池，再做后续处理，保证 IO 线程永远不被用户代码阻塞。
