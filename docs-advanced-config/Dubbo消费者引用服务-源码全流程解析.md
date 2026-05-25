@@ -1480,6 +1480,28 @@ Spring 启动时分两步处理 `@DubboReference`。第一步是 `BeanFactoryPos
 
 这个设计模式和 HTTP/2 的 streamId 本质相同——在一条连接上多路复用，靠唯一 ID 区分不同的请求/响应对。区别在于 Dubbo 的 requestId 是应用层自己管的（DefaultFuture + ConcurrentHashMap），而 HTTP/2 的 streamId 是协议层帧格式内置的（由 Netty 的 `Http2FrameCodec` 自动管理）。如果你自己手撸一个多路复用网络框架，核心逻辑也一定是这样：发请求时生成唯一 ID，存 ID→Future 的 map，收到响应时按 ID 取出 Future 然后 complete。
 
+**HTTP/2 场景下 `Http2FrameCodec` 的处理逻辑（类比 Dubbo Exchange 层）：**
+
+HTTP/2 协议把一条 TCP 连接拆分成多个逻辑流（Stream），每个流有唯一的 streamId。一次完整的请求/响应可能由多个帧（HEADERS 帧、DATA 帧、TRAILERS 帧）组成，这些帧在网络上是交错传输的。`Http2FrameCodec` 要做的事情本质上和 Dubbo 的 Exchange 层一样——**收集、区分、组装**：
+
+1. **区分**：每个帧头部都带着 streamId，`Http2FrameCodec` 收到帧后按 streamId 路由到对应的逻辑流。这就像 Dubbo 收到 Response 后按 requestId 找到对应的 DefaultFuture。
+
+2. **收集**：一个请求的 HEADERS 帧和多个 DATA 帧可能分多次到达。`Http2FrameCodec` 配合 `Http2MultiplexHandler` 为每个 stream 创建一个子 Channel（`Http2StreamChannel`），所有属于同一个 stream 的帧都会被投递到同一个子 Channel 的 pipeline 里，在那里按顺序收集和组装。
+
+3. **组装**：子 Channel 的 pipeline 中通常有 `Http2StreamFrameToHttpObjectCodec`（把 HTTP/2 帧转成 `HttpRequest`/`HttpContent`/`LastHttpContent`）或 gRPC 的帧解析器（按 gRPC Length-Prefixed Message 格式组装完整的 protobuf 消息）。组装完成后交给业务 handler 处理。
+
+对比关系：
+
+| 维度 | Dubbo Exchange 层 | HTTP/2 Http2FrameCodec |
+|------|-------------------|------------------------|
+| 多路复用 ID | requestId（AtomicLong 自增） | streamId（奇数=客户端发起，偶数=服务端推送） |
+| 存储结构 | `ConcurrentHashMap<Long, DefaultFuture>` | 每个 streamId 对应一个 `Http2StreamChannel` |
+| 帧收集 | 不需要（Dubbo 一个请求=一个完整帧） | 需要（一个请求=HEADERS+多个DATA+END_STREAM） |
+| 响应匹配 | 手动从 map 取 Future 并 complete | 自动路由到对应子 Channel，回调 handler |
+| 超时管理 | HashedWheelTimer + Future | 依赖应用层自己实现（gRPC 用 deadline） |
+
+简单说：Dubbo 的 Exchange 层是"轻量版多路复用"——一个请求就是一帧，收到响应直接按 ID 匹配完事。HTTP/2 的 `Http2FrameCodec` 是"重量版多路复用"——一个请求由多帧组成，需要先按 streamId 归类，再在子 Channel 里收集组装，最后才能交给业务处理。但核心思想一模一样：**唯一 ID + 路由分发**。
+
 ### 超时机制：HashedWheelTimer + Future
 
 `DefaultFuture` 创建时会用 `HashedWheelTimer`（时间轮）注册一个延迟任务。如果超时时间到了还没收到响应，时间轮触发检查，对 Future 调用 `completeExceptionally(new TimeoutException(...))`，同时从 `FUTURES` map 里移除（不会内存泄漏）。这个 TimeoutException 不是业务异常，所以 `FailoverClusterInvoker` 会 catch 住并重试下一个 Provider。

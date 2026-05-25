@@ -301,6 +301,209 @@ private void doExportUrls(RegisterTypeEnum registerType) {
 
 **关键点**：如果你配置了多个协议（比如同时配了 dubbo 和 tri），这里会循环多次，每个协议都暴露一遍。
 
+---
+
+### 3.3.1 多协议多次暴露 —— 完整拆解每一次暴露发生了什么
+
+> **为什么需要多次暴露？**
+>
+> 每种协议对应不同的网络传输方式和序列化格式，它们需要各自独立的端口监听和请求处理链路。dubbo 协议走自定义的二进制帧格式（默认端口 20880），Triple 协议走 gRPC/HTTP2（默认端口 50051），它们的字节解码、请求对象封装方式完全不同。所以一个服务如果想同时被这两种协议的消费者调用，就必须在两个端口上分别启动 Server，各自注册到 exporterMap 里。
+
+假设你的配置如下：
+
+```yaml
+dubbo:
+  protocols:
+    dubbo:
+      name: dubbo
+      port: 20880
+    tri:
+      name: tri
+      port: 50051
+  registry:
+    address: nacos://127.0.0.1:8848
+```
+
+服务接口为 `com.example.UserService`，版本 `1.0.0`。
+
+那么 `doExportUrls()` 中的 `for (ProtocolConfig protocolConfig : protocols)` 循环会执行**两次**，每次走完整个暴露链路。下面逐次拆解：
+
+---
+
+#### 第一次循环：dubbo 协议暴露
+
+**Step 1: doExportUrlsFor1Protocol(dubboProtocolConfig, registryURLs)**
+
+构建出服务 URL：
+```
+dubbo://192.168.1.100:20880/com.example.UserService?version=1.0.0&timeout=3000&methods=getUserById,createUser&...
+```
+
+**Step 2: exportUrl() 内部处理**
+
+(a) **本地暴露 exportLocal()**：
+
+URL 变形为 `injvm://127.0.0.1:0/com.example.UserService?...`，走 `InjvmProtocol.export()`。在内存中的 exporterMap 注册一个 InjvmExporter，不开任何端口。
+
+注意：本地暴露只会做一次。虽然循环执行了两次，但第二次 `exportLocal()` 检测到同接口已经做过本地暴露，会跳过（通过 `exportedLocalMap` 去重）。
+
+(b) **远程暴露 exportRemote()**：
+
+URL 套娃——把 `dubbo://192.168.1.100:20880/UserService?...` 塞进 `registry://127.0.0.1:8848/...` 的 `export` 属性里，然后调用 `doExportUrl()`。
+
+**Step 3: doExportUrl() -> protocolSPI.export(invoker)**
+
+SPI 根据 `registry://` 协议头路由到 `RegistryProtocol.export()`。
+
+**Step 4: RegistryProtocol.export()**
+
+- 从 registry URL 属性中取出真正的 provider URL：`dubbo://192.168.1.100:20880/UserService?...`
+- 调用 `doLocalExport()`：委托给 `DubboProtocol.export()`
+
+**Step 5: DubboProtocol.export()**
+
+- 生成 serviceKey = `com.example.UserService:1.0.0:20880`
+- 创建 `DubboExporter` 存入 `exporterMap`
+- 调用 `openServer(url)`：发现 `192.168.1.100:20880` 还没有 Server
+- 一路向下：`Exchangers.bind()` -> `HeaderExchanger.bind()` -> `Transporters.bind()` -> `NettyTransporter.bind()` -> `new NettyServer(url, handler)` -> `doOpen()` -> **bootstrap.bind(20880)**
+- **Netty Server 在 20880 端口启动，开始监听 dubbo 协议请求**
+
+**Step 6: 回到 RegistryProtocol.export()**
+
+- 向 Nacos 注册服务实例：`dubbo://192.168.1.100:20880/com.example.UserService?version=1.0.0&...`
+- Nacos 上出现一条服务实例记录
+
+**第一次循环的最终效果：**
+
+| 产物 | 内容 |
+|------|------|
+| 本地 exporterMap (InjvmProtocol) | `com.example.UserService` -> InjvmExporter |
+| 远程 exporterMap (DubboProtocol) | `com.example.UserService:1.0.0:20880` -> DubboExporter |
+| Netty Server | 监听 `0.0.0.0:20880`，处理 dubbo 二进制帧协议 |
+| Nacos 注册中心 | 新增实例 `dubbo://192.168.1.100:20880/com.example.UserService` |
+
+---
+
+#### 第二次循环：Triple 协议暴露
+
+**Step 1: doExportUrlsFor1Protocol(triProtocolConfig, registryURLs)**
+
+构建出服务 URL：
+```
+tri://192.168.1.100:50051/com.example.UserService?version=1.0.0&timeout=3000&methods=getUserById,createUser&...
+```
+
+**Step 2: exportUrl() 内部处理**
+
+(a) **本地暴露 exportLocal()**：
+
+检测到同接口已做过本地暴露，**跳过**。
+
+(b) **远程暴露 exportRemote()**：
+
+URL 套娃——把 `tri://192.168.1.100:50051/UserService?...` 塞进 `registry://127.0.0.1:8848/...` 的 `export` 属性里。
+
+**Step 3: doExportUrl() -> protocolSPI.export(invoker)**
+
+SPI 路由到 `RegistryProtocol.export()`。
+
+**Step 4: RegistryProtocol.export()**
+
+- 取出 provider URL：`tri://192.168.1.100:50051/UserService?...`
+- 调用 `doLocalExport()`：此时 providerUrlKey 与第一次不同（协议和端口都不同），所以不会命中引用计数复用，而是**创建新的 Exporter**
+- 委托给 `TripleProtocol.export()`
+
+**Step 5: TripleProtocol.export()**
+
+- 生成 serviceKey = `com.example.UserService:1.0.0:50051`
+- 创建 Exporter 存入 `exporterMap`
+- 注册 gRPC 路径映射：`/com.example.UserService/getUserById`、`/com.example.UserService/createUser`
+- 调用 `bindServerPort(url)`：发现 `192.168.1.100:50051` 还没有 Server
+- 一路向下：`PortUnificationExchanger.bind()` -> `new NettyPortUnificationServer(url, handler)` -> `doOpen0()` -> **bootstrap.bind(50051)**
+- **Netty Server 在 50051 端口启动，开始监听 HTTP/2 (gRPC) 请求**
+
+**Step 6: 回到 RegistryProtocol.export()**
+
+- 向 Nacos 注册服务实例：`tri://192.168.1.100:50051/com.example.UserService?version=1.0.0&...`
+- Nacos 上出现第二条服务实例记录
+
+**第二次循环的最终效果：**
+
+| 产物 | 内容 |
+|------|------|
+| 远程 exporterMap (TripleProtocol) | `com.example.UserService:1.0.0:50051` -> TripleExporter |
+| Netty Server | 监听 `0.0.0.0:50051`，处理 HTTP/2 (gRPC) 协议 |
+| Nacos 注册中心 | 新增实例 `tri://192.168.1.100:50051/com.example.UserService` |
+| gRPC 路径映射 | `/com.example.UserService/getUserById` -> Invoker |
+
+---
+
+#### 两次循环全部完成后的全局视图
+
+```
+                    ┌─────────────────────────────────────────────────────┐
+                    │              Nacos 注册中心                           │
+                    │                                                     │
+                    │  实例1: dubbo://192.168.1.100:20880/UserService     │
+                    │  实例2: tri://192.168.1.100:50051/UserService       │
+                    └─────────────────────────────────────────────────────┘
+
+                    ┌─────────────────────────────────────────────────────┐
+                    │              Provider JVM                            │
+                    │                                                     │
+                    │  InjvmProtocol.exporterMap:                         │
+                    │    "UserService" -> InjvmExporter (本地调用)          │
+                    │                                                     │
+                    │  DubboProtocol.exporterMap:                         │
+                    │    "UserService:1.0.0:20880" -> DubboExporter       │
+                    │                                                     │
+                    │  TripleProtocol.exporterMap:                        │
+                    │    "UserService:1.0.0:50051" -> TripleExporter      │
+                    │                                                     │
+                    │  NettyServer (port 20880) ← dubbo 协议消费者连接     │
+                    │  NettyPortUnificationServer (port 50051) ← gRPC 消费者连接  │
+                    │                                                     │
+                    │  UserServiceImpl (唯一实例，被三个 Exporter 共享引用) │
+                    └─────────────────────────────────────────────────────┘
+```
+
+**关键结论：**
+
+1. **一份代码，多种接入方式**：你只写了一个 `UserServiceImpl`，但通过多协议暴露，dubbo 老客户端和 gRPC 新客户端都能调到你
+2. **每种协议独立的 Server 和编解码**：dubbo 走 DubboCodec 二进制帧，Triple 走 HTTP/2 帧，互不干扰
+3. **exporterMap 按协议隔离**：DubboProtocol 和 TripleProtocol 各自有独立的 exporterMap，通过不同的 serviceKey（端口不同）区分
+4. **注册中心有两条记录**：消费者通过注册中心发现服务时，能看到两个地址，根据自己配置的协议选择对应的实例连接
+5. **本地暴露只做一次**：不管配了几个协议，injvm 暴露只做一次，因为本地调用不走网络，跟协议无关
+
+---
+
+#### 补充：引用计数复用（多注册中心场景）
+
+上面多协议的场景中，两次 `doLocalExport()` 的 providerUrlKey 不同（一个含 `dubbo:20880`，一个含 `tri:50051`），所以各自创建新的 Exporter。
+
+但如果是**同一协议 + 多注册中心**的场景：
+
+```yaml
+dubbo:
+  protocols:
+    dubbo:
+      port: 20880
+  registries:
+    nacos:
+      address: nacos://127.0.0.1:8848
+    zk:
+      address: zookeeper://127.0.0.1:2181
+```
+
+那么对于 dubbo 协议，`exportRemote()` 中会遍历两个 registryURL，两次都调用 `RegistryProtocol.export()`。两次进入 `doLocalExport()` 时，providerUrlKey 相同（都是 `dubbo://192.168.1.100:20880/UserService?...`）。引用计数机制保证：
+
+- 第一次：创建 DubboExporter，启动 NettyServer，引用计数 = 1
+- 第二次：命中同一个 providerUrlKey，直接复用已有 Exporter，引用计数 = 2，**不会重复启动 Server**
+
+两次的区别只在第 6 步：第一次注册到 Nacos，第二次注册到 Zookeeper。网络层只启动一次。
+
+---
+
 ### 3.4 doExportUrlsFor1Protocol() —— 构建服务 URL
 
 > **这一步在干什么？**
@@ -1081,3 +1284,654 @@ Handler 链使用装饰器模式层层包装：
 ## 一句话串联全流程
 
 > Spring 扫描到你的 `@DubboService` 注解类，注册为 `ServiceBean`；容器刷新完成后触发 `DefaultModuleDeployer.start()`；`ServiceConfig` 将你的服务实现通过 `JavassistProxyFactory` 包装为 `Invoker`（字节码生成避免反射）；然后通过 `RegistryProtocol` 先调用底层协议（`DubboProtocol`/`TripleProtocol`）的 `export()` 启动 Netty Server 监听端口，再向注册中心注册服务地址；至此，你的服务就对外可用了。
+
+---
+
+## 第十一阶段：Provider 接收请求并处理返回 —— 从字节流到业务方法调用
+
+> 前面十个阶段讲的都是"服务怎么暴露出去"。现在服务已经暴露了，Netty Server 在监听端口。当消费者发起一次 RPC 调用，Provider 端收到 TCP 字节流后，经历了怎样的旅程才最终调用到你的 `UserServiceImpl.getUserById()` 并把结果返回？下面逐层拆解。
+
+### 11.1 全局请求处理链路总览
+
+```
+Consumer 发送请求（TCP 字节流）
+  │
+  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Netty IO 线程                                                    │
+│                                                                   │
+│  1. DubboCodec.decode()                                          │
+│     → 解析 16 字节 Header + Body                                  │
+│     → 得到 Request 对象（含 RpcInvocation：方法名、参数）          │
+│                                                                   │
+│  2. NettyServerHandler.channelRead(ctx, msg)                     │
+│     → 触发 Dubbo Handler 链                                       │
+│                                                                   │
+│  3. AllChannelHandler.received(channel, message)                 │
+│     → 将消息 dispatch 到业务线程池（保护 IO 线程）                 │
+└────────────────────────────────┬──────────────────────────────────┘
+                                 │ 线程切换
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  业务线程池                                                        │
+│                                                                   │
+│  4. DecodeHandler.received()                                     │
+│     → 延迟解码（在业务线程中完成反序列化，避免阻塞 IO 线程）       │
+│                                                                   │
+│  5. HeaderExchangeHandler.received()                             │
+│     → 识别消息类型（Request/Response/心跳）                        │
+│     → 调用 handleRequest()                                        │
+│                                                                   │
+│  6. HeaderExchangeHandler.handleRequest()                        │
+│     → 调用 DubboProtocol.requestHandler.reply()                  │
+│     → 拿到异步 Future                                             │
+│     → Future 完成后将 Response 写回 Channel                       │
+│                                                                   │
+│  7. DubboProtocol.requestHandler.reply()                         │
+│     → 通过 serviceKey 从 exporterMap 找到 Exporter                │
+│     → 拿到 Invoker                                                │
+│     → 经过 Filter 链                                              │
+│     → 调用 AbstractProxyInvoker.invoke()                         │
+│       → Wrapper.invokeMethod()                                   │
+│         → UserServiceImpl.getUserById(1)  ← 你的业务代码!          │
+│                                                                   │
+│  8. 结果返回                                                      │
+│     → AppResponse（包含返回值或异常）                              │
+│     → 封装为 Response 对象（带上 requestId）                       │
+│     → DubboCodec.encode() 编码为字节流                            │
+│     → Netty Channel.writeAndFlush() 发送回 Consumer               │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### 11.2 DubboCodec.decode() —— 协议解码
+
+**源码位置**: `dubbo-rpc/dubbo-rpc-dubbo/src/main/java/org/apache/dubbo/rpc/protocol/dubbo/DubboCodec.java`
+
+> **这一步在干什么？**
+>
+> Netty 收到的是原始字节流。DubboCodec 负责按照 Dubbo 协议的帧格式把字节流切割、解析成一个 `Request` 对象。回忆一下 Dubbo 协议帧格式（16 字节 Header + Body）：
+>
+> ```
+> ┌──────────────────────────────────────────────────────────────┐
+> │  0-1:  Magic Number (0xdabb) —— 魔数，标识这是 Dubbo 协议     │
+> │  2:    Flag (请求/响应、单向/双向、心跳、序列化方式)             │
+> │  3:    Status (仅响应有效)                                     │
+> │  4-11: Request ID (8字节 long)                                 │
+> │  12-15: Body Length (4字节 int)                                │
+> │  16-...: Body (序列化后的 RpcInvocation)                       │
+> └──────────────────────────────────────────────────────────────┘
+> ```
+>
+> Header 解析在 IO 线程完成（很快，就是读几个字节）。Body 的反序列化（把字节变成 Java 对象）可以延迟到业务线程做（通过 DecodeHandler），避免阻塞 IO 线程。
+
+```java
+@Override
+protected Object decodeBody(Channel channel, InputStream is, byte[] header) throws IOException {
+    byte flag = header[2];
+    byte proto = (byte) (flag & SERIALIZATION_MASK);  // 序列化方式（Hessian2/Fastjson等）
+
+    // 获取 requestId
+    long id = Bytes.bytes2long(header, 4);
+
+    // 判断是请求还是响应
+    if ((flag & FLAG_REQUEST) != 0) {
+        // ===== 这是一个请求 =====
+        Request req = new Request(id);
+        req.setVersion(Version.getProtocolVersion());
+        req.setTwoWay((flag & FLAG_TWOWAY) != 0);
+
+        if ((flag & FLAG_EVENT) != 0) {
+            req.setEvent(true);  // 心跳或事件
+        }
+
+        // 解码 Body → RpcInvocation（方法名、参数类型、参数值）
+        ObjectInput in = CodecSupport.getSerialization(url, proto)
+                .deserialize(url, is);
+        // 延迟解码模式下只是包装一层，真正的反序列化在业务线程做
+        DecodeableRpcInvocation inv = new DecodeableRpcInvocation(
+                channel, req, is, proto);
+        inv.decode();  // 或延迟到 DecodeHandler 中 decode
+
+        req.setData(inv);
+        return req;
+    } else {
+        // 这是一个响应（Provider 端通常不会收到响应，这里不展开）
+        // ...
+    }
+}
+```
+
+**RpcInvocation 解码后包含的信息：**
+
+```java
+public class RpcInvocation {
+    private String methodName;           // "getUserById"
+    private Class<?>[] parameterTypes;   // [Long.class]
+    private Object[] arguments;          // [1L]
+    private String serviceName;          // "com.example.UserService"
+    private String serviceVersion;       // "1.0.0"
+    private Map<String, Object> attachments;  // 附加参数（timeout、token等）
+}
+```
+
+### 11.3 NettyServerHandler.channelRead() —— Netty 入站处理
+
+**源码位置**: `dubbo-remoting/dubbo-remoting-netty4/src/main/java/org/apache/dubbo/remoting/transport/netty4/NettyServerHandler.java`
+
+> Netty Pipeline 中最后一个 Handler 是 `NettyServerHandler`，它负责把 Netty 的事件桥接到 Dubbo 的 Handler 链。
+
+```java
+@Override
+public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+    NettyChannel channel = NettyChannel.getOrAddChannel(ctx.channel(), url, handler);
+    // 触发 Dubbo Handler 链的 received 方法
+    handler.received(channel, msg);
+}
+```
+
+这里的 `handler` 就是在服务暴露时层层包装的 Handler 链。调用链如下：
+
+```
+NettyServerHandler.channelRead()
+  → MultiMessageHandler.received()      // 处理批量消息
+    → HeartbeatHandler.received()        // 过滤心跳消息
+      → AllChannelHandler.received()     // 线程派发!
+```
+
+### 11.4 AllChannelHandler.received() —— IO 线程到业务线程的切换
+
+**源码位置**: `dubbo-remoting/dubbo-remoting-api/src/main/java/org/apache/dubbo/remoting/transport/dispatcher/all/AllChannelHandler.java`
+
+> **这一步在干什么？**
+>
+> Netty 的 IO 线程（EventLoop）非常宝贵——一个 IO 线程管多个连接的读写。如果在 IO 线程上做耗时的业务处理（反序列化参数、调用业务方法、序列化响应），就会阻塞这个线程管的所有连接。所以这里必须切线程：把消息扔到业务线程池，IO 线程立刻回去继续处理网络 IO。
+
+```java
+@Override
+public void received(Channel channel, Object message) throws RemotingException {
+    // 获取业务线程池
+    ExecutorService executor = getPreferredExecutorService(message);
+    try {
+        // 将消息封装成 Runnable 提交到业务线程池
+        executor.execute(new ChannelEventRunnable(channel, handler, ChannelState.RECEIVED, message));
+    } catch (Throwable t) {
+        // 线程池满时的处理（根据策略：丢弃/抛异常/调用方执行）
+        if (message instanceof Request && t instanceof RejectedExecutionException) {
+            sendFeedback(channel, (Request) message, t);
+            return;
+        }
+        throw new ExecutionException(message, channel, getClass() + " error when process received event.", t);
+    }
+}
+```
+
+**线程池满时的降级处理：** 如果业务线程池满了（`RejectedExecutionException`），Dubbo 不会默默丢弃请求，而是构造一个"服务端线程池满"的错误 Response 返回给消费者，让消费者知道怎么回事（可以重试其他 Provider）。
+
+```java
+private void sendFeedback(Channel channel, Request request, Throwable t) {
+    if (request.isTwoWay()) {
+        Response response = new Response(request.getId(), request.getVersion());
+        response.setStatus(Response.SERVER_THREADPOOL_EXHAUSTED_ERROR);
+        response.setErrorMessage("Server side thread pool is exhausted...");
+        channel.send(response);
+    }
+}
+```
+
+### 11.5 DecodeHandler.received() —— 延迟解码
+
+**源码位置**: `dubbo-remoting/dubbo-remoting-api/src/main/java/org/apache/dubbo/remoting/transport/DecodeHandler.java`
+
+> **这一步在干什么？**
+>
+> 前面 DubboCodec 解码时，如果配置了延迟解码（`decode.in.io=false`，默认行为），Body 的反序列化不会在 IO 线程做，而是留到业务线程里做。DecodeHandler 就是在业务线程中完成这个"延迟的反序列化"。
+
+```java
+@Override
+public void received(Channel channel, Object message) throws RemotingException {
+    if (message instanceof Decodeable) {
+        decode(message);  // 在业务线程中完成反序列化
+    }
+    if (message instanceof Request) {
+        decode(((Request) message).getData());  // 反序列化 RpcInvocation 的参数
+    }
+    if (message instanceof Response) {
+        decode(((Response) message).getResult());
+    }
+    handler.received(channel, message);  // 继续传递
+}
+
+private void decode(Object message) {
+    if (message instanceof Decodeable) {
+        try {
+            ((Decodeable) message).decode();
+            // 此时 RpcInvocation 里的 arguments 才真正变成 Java 对象
+            // 比如 arguments[0] 从字节变成了 Long(1)
+        } catch (Throwable e) {
+            logger.warn("Decode message failed: " + e.getMessage(), e);
+        }
+    }
+}
+```
+
+### 11.6 HeaderExchangeHandler.received() —— 识别消息类型
+
+**源码位置**: `dubbo-remoting/dubbo-remoting-api/src/main/java/org/apache/dubbo/remoting/exchange/support/header/HeaderExchangeHandler.java`
+
+> **这一步在干什么？**
+>
+> TCP 连接上跑的消息有好几种：普通 RPC 请求、心跳请求、事件消息等。`HeaderExchangeHandler` 负责识别消息类型并分发处理。对于普通的 RPC 请求，它调用 `handleRequest()` 处理。
+
+```java
+@Override
+public void received(Channel channel, Object message) throws RemotingException {
+    final ExchangeChannel exchangeChannel = HeaderExchangeChannel.getOrAddChannel(channel);
+
+    if (message instanceof Request) {
+        Request request = (Request) message;
+
+        if (request.isEvent()) {
+            // 事件消息（如只读事件）
+            handlerEvent(channel, request);
+        } else if (request.isTwoWay()) {
+            // ===== 双向请求（需要返回响应）—— 绝大多数 RPC 调用走这里 =====
+            handleRequest(exchangeChannel, request);
+        } else {
+            // 单向请求（不需要响应）
+            handler.received(exchangeChannel, request.getData());
+        }
+    } else if (message instanceof Response) {
+        handleResponse(channel, (Response) message);
+    } else {
+        handler.received(exchangeChannel, message);
+    }
+}
+```
+
+### 11.7 HeaderExchangeHandler.handleRequest() —— 调用业务逻辑并写回响应
+
+> **这是请求处理的核心枢纽。** 它做三件事：
+> 1. 调用上层 handler 的 `reply()` 方法，获得业务处理结果（异步 Future）
+> 2. 当 Future 完成后，将结果封装为 Response
+> 3. 通过 Channel 把 Response 写回给消费者
+
+```java
+void handleRequest(final ExchangeChannel channel, Request req) throws RemotingException {
+    // 1. 构造 Response（带上相同的 requestId，消费者靠这个匹配）
+    Response res = new Response(req.getId(), req.getVersion());
+
+    // 2. 检查请求合法性
+    if (req.isBroken()) {
+        // 请求解码就出错了（比如反序列化失败）
+        res.setStatus(Response.BAD_REQUEST);
+        res.setErrorMessage("Fail to decode request due to: " + req.getData());
+        channel.send(res);
+        return;
+    }
+
+    // 3. 取出 RpcInvocation
+    Object msg = req.getData();
+
+    try {
+        // ===== 4. 核心：调用业务逻辑 =====
+        // handler 就是 DubboProtocol 的 requestHandler
+        // reply() 返回的是 CompletableFuture<Object>
+        CompletableFuture<Object> future = handler.reply(channel, msg);
+
+        // 5. 等 Future 完成后写回响应
+        future.whenComplete((appResult, t) -> {
+            try {
+                if (t == null) {
+                    // 正常完成
+                    res.setStatus(Response.OK);
+                    res.setResult(appResult);
+                } else {
+                    // 业务处理异常
+                    res.setStatus(Response.SERVICE_ERROR);
+                    res.setErrorMessage(StringUtils.toString(t));
+                }
+                // ===== 6. 写回 Response! =====
+                channel.send(res);
+            } catch (RemotingException e) {
+                logger.warn("Send result to consumer failed for request: " + req + ", response: " + res);
+            }
+        });
+    } catch (Throwable e) {
+        // handler.reply() 本身就抛异常了
+        res.setStatus(Response.SERVICE_ERROR);
+        res.setErrorMessage(StringUtils.toString(e));
+        channel.send(res);
+    }
+}
+```
+
+**关键点**：Response 里带的 `req.getId()` 就是那个 requestId——消费者收到 Response 后，靠这个 ID 从 `FUTURES` map 里找到对应的 `DefaultFuture` 并 complete。
+
+### 11.8 DubboProtocol.requestHandler.reply() —— 找到 Invoker 并调用
+
+**源码位置**: `dubbo-rpc/dubbo-rpc-dubbo/src/main/java/org/apache/dubbo/rpc/protocol/dubbo/DubboProtocol.java`
+
+> **这一步在干什么？**
+>
+> 请求到了这里，终于要找到你的 `UserServiceImpl` 并调用了。怎么找？还记得暴露阶段 `DubboProtocol.export()` 里把 `DubboExporter` 以 `serviceKey` 为 key 存进了 `exporterMap` 吗？现在就靠这个 key 去查：
+
+```java
+private ExchangeHandler requestHandler = new ExchangeHandlerAdapter() {
+    @Override
+    public CompletableFuture<Object> reply(ExchangeChannel channel, Object message) throws RemotingException {
+        if (!(message instanceof Invocation)) {
+            throw new RemotingException(channel, "Unsupported request: " + message);
+        }
+        Invocation inv = (Invocation) message;
+
+        // ===== 1. 通过 serviceKey 找到对应的 Invoker =====
+        // serviceKey 格式："group/com.example.UserService:version:port"
+        // 这个 key 是从 RpcInvocation 的 attachments 中取的
+        Invoker<?> invoker = getInvoker(channel, inv);
+
+        // 2. 设置远端地址到上下文
+        RpcContext.getServiceContext().setRemoteAddress(channel.getRemoteAddress());
+
+        // ===== 3. 调用 Invoker 链! =====
+        Result result = invoker.invoke(inv);
+
+        // 4. 返回异步结果
+        return result.thenApply(Function.identity());
+    }
+};
+```
+
+### 11.9 getInvoker() —— 从 exporterMap 查找
+
+```java
+Invoker<?> getInvoker(Channel channel, Invocation inv) throws RemotingException {
+    int port = channel.getLocalAddress().getPort();
+
+    // 构建 serviceKey
+    String serviceKey = serviceKey(
+            port,
+            inv.getObjectAttachments().get(PATH_KEY).toString(),      // 接口路径
+            inv.getObjectAttachments().get(VERSION_KEY).toString(),    // 版本号
+            inv.getObjectAttachments().get(GROUP_KEY) != null ?
+                    inv.getObjectAttachments().get(GROUP_KEY).toString() : null  // 分组
+    );
+
+    // 从 exporterMap 中查找
+    DubboExporter<?> exporter = (DubboExporter<?>) exporterMap.get(serviceKey);
+    if (exporter == null) {
+        throw new RemotingException(channel,
+                "Not found exported service: " + serviceKey + " in " + exporterMap.keySet());
+    }
+
+    return exporter.getInvoker();
+}
+```
+
+**为什么能找到？** 因为在暴露阶段（第六阶段 6.1），`DubboProtocol.export()` 已经把 `DubboExporter` 存入了这个 map：
+
+```java
+// 暴露时存入
+DubboExporter<T> exporter = new DubboExporter<>(invoker, key, exporterMap);
+// 请求时取出
+DubboExporter<?> exporter = (DubboExporter<?>) exporterMap.get(serviceKey);
+```
+
+### 11.10 Filter 链 —— 请求到达业务代码前的切面处理
+
+> **这一步在干什么？**
+>
+> 拿到 Invoker 之后，调用 `invoker.invoke(inv)` 并不是直接到你的业务代码。中间还有一层 Filter 链（通过 Dubbo SPI 的 Wrapper 机制自动包装）。Provider 端常见的 Filter 包括：
+
+```
+请求进入
+  → EchoFilter            // Echo 测试（消费者发 $echo 直接返回，不走业务）
+    → ClassLoaderFilter   // 切换 ClassLoader 上下文
+      → GenericFilter     // 泛化调用支持
+        → ContextFilter   // 设置 RpcContext（远端IP、attachments等）
+          → TimeoutFilter // 超时检测（如果请求在网络传输中已经超时了，直接返回）
+            → ExceptionFilter  // 异常包装（把非声明异常包装为 RuntimeException）
+              → AbstractProxyInvoker.invoke()  ← 真正调用业务代码
+```
+
+以 `ContextFilter` 为例：
+
+```java
+@Activate(group = PROVIDER)
+public class ContextFilter implements Filter {
+    @Override
+    public Result invoke(Invoker<?> invoker, Invocation invocation) throws RpcException {
+        // 把消费者传来的 attachments 设置到 RpcContext
+        Map<String, Object> attachments = invocation.getObjectAttachments();
+        RpcContext context = RpcContext.getServiceContext();
+        context.setInvoker(invoker);
+        context.setInvocation(invocation);
+        context.setLocalAddress(invoker.getUrl().toInetSocketAddress());
+        context.setRemoteAddress(
+                (InetSocketAddress) invocation.get(REMOTE_ADDRESS_KEY));
+
+        // 继续调用链
+        return invoker.invoke(invocation);
+    }
+}
+```
+
+以 `TimeoutFilter` 为例（Provider 端的超时短路）：
+
+```java
+@Activate(group = PROVIDER)
+public class TimeoutFilter implements Filter {
+    @Override
+    public Result invoke(Invoker<?> invoker, Invocation invocation) throws RpcException {
+        // 检查请求是否已经在传输中超时了
+        long timeout = Long.parseLong(
+                invocation.getObjectAttachment(TIMEOUT_KEY, "0").toString());
+        long startTime = Long.parseLong(
+                invocation.getObjectAttachment(TIMEOUT_COUNTDOWN_KEY, "0").toString());
+
+        if (timeout > 0 && startTime > 0) {
+            long elapsed = System.currentTimeMillis() - startTime;
+            if (elapsed > timeout) {
+                // 请求已超时，消费者那边 Future 已经超时完成了
+                // 即使执行了结果也没人要，直接返回，节省 Provider 资源
+                logger.warn("invoke timeout, discard request...");
+                return AsyncRpcResult.newDefaultAsyncResult(
+                        new RpcException("Provider side timeout"), invocation);
+            }
+        }
+        return invoker.invoke(invocation);
+    }
+}
+```
+
+### 11.11 AbstractProxyInvoker.invoke() —— 调用你的业务代码
+
+**源码位置**: `dubbo-rpc/dubbo-rpc-api/src/main/java/org/apache/dubbo/rpc/proxy/AbstractProxyInvoker.java`
+
+> **终于到了！** Filter 链走完之后，调用到达 `AbstractProxyInvoker`——这就是暴露阶段（第四阶段）用 `proxyFactory.getInvoker()` 创建的那个 Invoker。它内部持有你的 `UserServiceImpl` 实例和 Javassist 生成的 `Wrapper`。
+
+```java
+@Override
+public Result invoke(Invocation invocation) throws RpcException {
+    try {
+        // ===== 调用你的业务代码! =====
+        // doInvoke 内部是 wrapper.invokeMethod(proxy, methodName, parameterTypes, arguments)
+        // 即：UserServiceImpl.getUserById(1L)
+        Object value = doInvoke(proxy, invocation.getMethodName(),
+                invocation.getParameterTypes(), invocation.getArguments());
+
+        // 处理异步返回值
+        CompletableFuture<Object> future = wrapWithFuture(value, invocation);
+
+        // 封装为 AppResponse
+        CompletableFuture<AppResponse> appResponseFuture = future.handle((obj, t) -> {
+            AppResponse result = new AppResponse(invocation);
+            if (t != null) {
+                // 业务方法抛了异常
+                if (t instanceof CompletionException) {
+                    t = t.getCause();
+                }
+                result.setException(t);
+            } else {
+                // 正常返回
+                result.setValue(obj);
+            }
+            return result;
+        });
+
+        return new AsyncRpcResult(appResponseFuture, invocation);
+    } catch (InvocationTargetException e) {
+        // 反射/字节码调用抛异常（InvocationTargetException 包装的是真正的业务异常）
+        return AsyncRpcResult.newDefaultAsyncResult(null, e.getTargetException(), invocation);
+    }
+}
+```
+
+`doInvoke()` 内部就是 Wrapper 的字节码直接调用：
+
+```java
+// Wrapper 生成的字节码（伪代码）
+Object invokeMethod(Object instance, String methodName, Class<?>[] types, Object[] args) {
+    UserServiceImpl impl = (UserServiceImpl) instance;
+    if ("getUserById".equals(methodName)) {
+        return impl.getUserById((Long) args[0]);  // ← 直接调用，没有反射!
+    }
+    // ...
+}
+```
+
+### 11.12 响应编码与发送 —— 从 Result 到字节流
+
+> 业务方法执行完毕，返回值被封装成 `AppResponse`，通过 `AsyncRpcResult` 的 Future 传回到 `HeaderExchangeHandler.handleRequest()` 里的 `whenComplete` 回调。回调里把 `AppResponse` 塞进 `Response` 对象，然后调用 `channel.send(res)` 写回消费者。
+
+```
+AppResponse（value=User对象 或 exception=业务异常）
+  │
+  ▼
+Response 对象
+  ├── id = requestId（和请求相同，消费者靠它匹配 Future）
+  ├── status = Response.OK（或 SERVICE_ERROR）
+  └── result = AppResponse
+  │
+  ▼
+channel.send(response)
+  → NettyChannel.send(message)
+    → NioSocketChannel.writeAndFlush(message)
+      → Netty Pipeline 出站
+        → DubboCodec.encode()
+```
+
+**DubboCodec.encode() 编码响应：**
+
+```java
+@Override
+protected void encodeResponse(Channel channel, OutputStream os, Response res) throws IOException {
+    // 1. 写 Header（16字节）
+    byte[] header = new byte[HEADER_LENGTH];
+    // Magic Number
+    Bytes.short2bytes(MAGIC, header);
+    // Flag: 标记为响应
+    header[2] = res.isHeartbeat() ? (byte) (FLAG_EVENT | serialization.getContentTypeId())
+            : serialization.getContentTypeId();
+    // Status
+    header[3] = res.getStatus();
+    // Request ID（和请求相同!）
+    Bytes.long2bytes(res.getId(), header, 4);
+
+    // 2. 写 Body（序列化 AppResponse）
+    ObjectOutput out = serialization.serialize(url, os);
+    if (res.getStatus() == Response.OK) {
+        if (res.isHeartbeat()) {
+            out.writeObject(res.getResult());  // 心跳响应
+        } else {
+            // 序列化业务返回值
+            AppResponse appResponse = (AppResponse) res.getResult();
+            if (appResponse.hasException()) {
+                out.writeObject(appResponse.getException());
+            } else {
+                out.writeObject(appResponse.getValue());  // 序列化 User 对象
+            }
+        }
+    } else {
+        out.writeUTF(res.getErrorMessage());  // 错误信息
+    }
+
+    // 3. 回填 Body Length 到 Header
+    int bodyLength = out.getBufferSize();
+    Bytes.int2bytes(bodyLength, header, 12);
+
+    // 4. 先写 Header 再写 Body
+    os.write(header);
+    out.flushBuffer();
+}
+```
+
+### 11.13 响应到达消费者 —— 闭环
+
+响应字节流通过 TCP 发送到消费者端。消费者端的处理链路（详见消费者文档）：
+
+```
+TCP 字节流到达 Consumer
+  → DubboCodec.decode() 解码为 Response 对象
+    → NettyClientHandler.channelRead()
+      → AllChannelHandler.received() → 切到业务线程
+        → HeaderExchangeHandler.handleResponse()
+          → DefaultFuture.received(channel, response)
+            → FUTURES.remove(response.getId())  // 通过 requestId 找到 Future
+            → future.complete(response.getResult())
+              → CompletableFuture 完成
+                → AsyncRpcResult.recreate()
+                  → 返回 User 对象给调用者
+```
+
+至此，一次完整的 RPC 调用闭环完成。
+
+---
+
+## 11.14 关键设计总结：请求处理阶段
+
+### 线程模型
+
+```
+IO 线程（Netty EventLoop）           业务线程池
+     │                                    │
+     │  1. 读取 TCP 字节流                 │
+     │  2. Header 解码                     │
+     │  3. 触发 Handler 链                 │
+     │                                    │
+     │── AllChannelHandler.received() ──→ │
+     │   （dispatch 到业务线程池）          │
+     │                                    │  4. Body 反序列化（延迟解码）
+     │  返回继续处理其他连接的 IO           │  5. 查找 Invoker
+     │                                    │  6. Filter 链
+     │                                    │  7. 调用业务方法
+     │                                    │  8. 封装 Response
+     │                                    │
+     │←── channel.send(response) ────────│
+     │                                    │
+     │  9. 编码 Response                   │
+     │  10. TCP 发送                       │
+```
+
+### exporterMap —— 请求路由的核心
+
+```java
+// 暴露时：存入
+exporterMap.put("com.example.UserService:1.0.0:20880", exporter);
+
+// 请求时：取出
+Invoker<?> invoker = exporterMap.get(serviceKey).getInvoker();
+```
+
+同一个端口可以暴露多个服务，靠 `serviceKey` 区分。这就是为什么 DubboProtocol 用 `host:port` 做 key 只启动一个 Server，但可以服务多个接口。
+
+### 异步全链路
+
+从 `invoker.invoke()` 返回 `AsyncRpcResult`（包含 CompletableFuture），到 `handleRequest()` 的 `whenComplete()` 回调写 Response——整个流程都是异步的。如果你的业务方法返回 `CompletableFuture<User>`，Dubbo 会直接把这个 Future 接上去，业务线程不会阻塞。只有同步方法才会在业务线程中阻塞等待方法执行完毕。
+
+### Provider 端超时保护
+
+`TimeoutFilter` 在调用业务方法之前会检查：请求从消费者发出到现在已经过了多久？如果已经超过了 timeout，说明消费者那边的 Future 已经超时完成了（抛了 TimeoutException），即使 Provider 执行了结果也没人要。这时 Provider 直接丢弃请求，节省线程资源。
+
+### 线程池满的优雅降级
+
+当业务线程池满了（`RejectedExecutionException`），Provider 不会默默丢弃请求，而是在 IO 线程上直接构造一个 `SERVER_THREADPOOL_EXHAUSTED_ERROR` 的 Response 返回给消费者。消费者收到后会重试其他 Provider（如果用的是 FailoverCluster）。
