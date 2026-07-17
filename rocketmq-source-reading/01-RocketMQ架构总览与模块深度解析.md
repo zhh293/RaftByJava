@@ -8195,7 +8195,503 @@ public CompletableFuture<RemotingCommand> processRequest(ChannelHandlerContext c
 }
 ```
 
-**步骤6：CommitLog.asyncPutMessage** 是最核心的存储操作，它将消息写入 MappedFile（内存映射文件），利用 mmap 零拷贝技术实现高吞吐写入。写入成功后，`ReputMessageService` 异步将消息分发到 ConsumeQueue 和 IndexFile。
+**步骤6：CommitLog.asyncPutMessage —— 消息存储的核心路径**
+
+这是 RocketMQ 最核心的存储操作。当 `SendMessageProcessor` 调用 `messageStore.asyncPutMessage(msgInner)` 后，执行进入 `CommitLog.asyncPutMessage`。整个写入过程分为两个阶段：**预编码（encode）** 和 **追加写入（doAppend）**，中间穿插锁、偏移量分配、HA 同步等关键逻辑。
+
+**第一阶段：asyncPutMessage 主流程**
+
+```java
+// 源码路径: store/src/main/java/org/apache/rocketmq/store/CommitLog.java
+// 行 969-1140
+public CompletableFuture<PutMessageResult> asyncPutMessage(final MessageExtBrokerInner msg) {
+    // 1. 设置存储时间戳（非副本模式）
+    if (!defaultMessageStore.getMessageStoreConfig().isDuplicationEnable()) {
+        msg.setStoreTimestamp(System.currentTimeMillis());
+    }
+    // 2. 计算消息体CRC32
+    msg.setBodyCRC(UtilAll.crc32(msg.getBody()));
+    
+    // 3. 根据Topic长度选择消息版本
+    msg.setVersion(MessageVersion.MESSAGE_VERSION_V1);
+    boolean autoMessageVersionOnTopicLen =
+        this.defaultMessageStore.getMessageStoreConfig().isAutoMessageVersionOnTopicLen();
+    if (autoMessageVersionOnTopicLen && topic.length() > Byte.MAX_VALUE) {
+        msg.setVersion(MessageVersion.MESSAGE_VERSION_V2);  // V2: topic长度用2字节
+    }
+    
+    // 4. 检测IPv6地址，设置SYS_FLAG中的V6标志位
+    InetSocketAddress bornSocketAddress = (InetSocketAddress) msg.getBornHost();
+    if (bornSocketAddress.getAddress() instanceof Inet6Address) {
+        msg.setBornHostV6Flag();   // BORNHOST_V6_FLAG → 20字节
+    }
+    InetSocketAddress storeSocketAddress = (InetSocketAddress) msg.getStoreHost();
+    if (storeSocketAddress.getAddress() instanceof Inet6Address) {
+        msg.setStoreHostV6Flag();  // STOREHOSTADDRESS_V6_FLAG → 20字节
+    }
+    
+    // 5. 获取当前可写的 MappedFile
+    MappedFile mappedFile = this.mappedFileQueue.getLastMappedFile();
+    long currOffset = (mappedFile == null) ? 0 
+        : mappedFile.getFileFromOffset() + mappedFile.getWrotePosition();
+    
+    // 6. HA同步前置检查（Controller模式 / SlaveActingMaster模式）
+    if (needHandleHA && brokerConfig.isEnableControllerMode()) {
+        if (haService.inSyncReplicasNums(currOffset) < minInSyncReplicas) {
+            return CompletableFuture.completedFuture(
+                new PutMessageResult(PutMessageStatus.IN_SYNC_REPLICAS_NOT_ENOUGH, null));
+        }
+    }
+    
+    // 7. TopicQueueLock — 保证同一 Topic+QueueId 的偏移量分配串行化
+    topicQueueLock.lock(topicQueueKey);
+    try {
+        // 8. 分配 QueueOffset（关键！在编码之前分配）
+        if (needAssignOffset) {
+            defaultMessageStore.assignOffset(msg);
+        }
+        
+        // 9. ★ 预编码：将消息所有字段写入 thread-local ByteBuf
+        PutMessageResult encodeResult = putMessageThreadLocal.getEncoder().encode(msg);
+        if (encodeResult != null) {
+            return CompletableFuture.completedFuture(encodeResult);  // 编码失败
+        }
+        msg.setEncodedBuff(putMessageThreadLocal.getEncoder().getEncoderBuffer());
+        
+        // 10. ★ putMessageLock — 串行写入 CommitLog（自旋锁或ReentrantLock）
+        putMessageLock.lock();
+        try {
+            long beginLockTimestamp = this.defaultMessageStore.getSystemClock().now();
+            this.beginTimeInLock = beginLockTimestamp;
+            
+            // 在锁内重新设置存储时间戳，保证全局有序
+            if (!defaultMessageStore.getMessageStoreConfig().isDuplicationEnable()) {
+                msg.setStoreTimestamp(beginLockTimestamp);
+            }
+            
+            // 11. 如果当前MappedFile为空或已满，创建新文件
+            if (null == mappedFile || mappedFile.isFull()) {
+                mappedFile = this.mappedFileQueue.getLastMappedFile(0);
+            }
+            
+            // 12. ★ 追加写入：调用 MappedFile.appendMessage
+            //     内部委托给 DefaultAppendMessageCallback.doAppend
+            result = mappedFile.appendMessage(msg, this.appendMessageCallback, putMessageContext);
+            
+            switch (result.getStatus()) {
+                case PUT_OK:
+                    onCommitLogAppend(msg, result, mappedFile);
+                    break;
+                case END_OF_FILE:
+                    // 当前文件已满，写入了空白标记
+                    onCommitLogAppend(msg, result, mappedFile);
+                    // 创建新文件，重新写入消息
+                    mappedFile = this.mappedFileQueue.getLastMappedFile(0);
+                    result = mappedFile.appendMessage(msg, this.appendMessageCallback, putMessageContext);
+                    if (AppendMessageStatus.PUT_OK.equals(result.getStatus())) {
+                        onCommitLogAppend(msg, result, mappedFile);
+                    }
+                    break;
+                case MESSAGE_SIZE_EXCEEDED:
+                case PROPERTIES_SIZE_EXCEEDED:
+                    return CompletableFuture.completedFuture(
+                        new PutMessageResult(PutMessageStatus.MESSAGE_ILLEGAL, result));
+                case UNKNOWN_ERROR:
+                default:
+                    return CompletableFuture.completedFuture(
+                        new PutMessageResult(PutMessageStatus.UNKNOWN_ERROR, result));
+            }
+        } finally {
+            beginTimeInLock = 0;
+            putMessageLock.unlock();
+        }
+        
+        // 13. 写入成功，递增 TopicQueue 偏移量
+        if (AppendMessageStatus.PUT_OK.equals(result.getStatus())) {
+            this.defaultMessageStore.increaseOffset(msg, getMessageNum(msg));
+        }
+    } finally {
+        topicQueueLock.unlock(topicQueueKey);
+    }
+    
+    // 14. 处理刷盘和HA同步（异步）
+    return handleDiskFlushAndHA(putMessageResult, msg, needAckNums, needHandleHA);
+}
+```
+
+**第二阶段：MessageExtEncoder.encode() —— 逐字段预编码**
+
+在 `asyncPutMessage` 第9步，`MessageExtEncoder.encode()` 将消息的所有字段按固定顺序写入 thread-local `ByteBuf`。这是消息二进制格式的核心：
+
+```java
+// 源码路径: store/src/main/java/org/apache/rocketmq/store/MessageExtEncoder.java
+// 行 175-280
+public PutMessageResult encode(MessageExtBrokerInner msgInner) {
+    this.byteBuf.clear();
+    
+    // 序列化properties为字节数组
+    final byte[] propertiesData =
+        msgInner.getPropertiesString() == null ? null 
+            : msgInner.getPropertiesString().getBytes(MessageDecoder.CHARSET_UTF8);
+    final int propertiesLength = (propertiesData == null ? 0 : propertiesData.length) 
+        + (needAppendLastPropertySeparator ? 1 : 0) + crc32ReservedLength;
+    
+    final byte[] topicData = msgInner.getTopic().getBytes(MessageDecoder.CHARSET_UTF8);
+    final int topicLength = topicData.length;
+    final int bodyLength = msgInner.getBody() == null ? 0 : msgInner.getBody().length;
+    
+    // 计算消息总长度
+    final int msgLen = calMsgLength(
+        msgInner.getVersion(), msgInner.getSysFlag(), bodyLength, topicLength, propertiesLength);
+    
+    // 1 TOTALSIZE (4字节)
+    this.byteBuf.writeInt(msgLen);
+    // 2 MAGICCODE (4字节) — MESSAGE_MAGIC_CODE = -626843481
+    this.byteBuf.writeInt(msgInner.getVersion().getMagicCode());
+    // 3 BODYCRC (4字节)
+    this.byteBuf.writeInt(msgInner.getBodyCRC());
+    // 4 QUEUEID (4字节)
+    this.byteBuf.writeInt(msgInner.getQueueId());
+    // 5 FLAG (4字节)
+    this.byteBuf.writeInt(msgInner.getFlag());
+    // 6 QUEUEOFFSET (8字节) — 占位，doAppend时回填
+    this.byteBuf.writeLong(queueOffset);
+    // 7 PHYSICALOFFSET (8字节) — 占位，doAppend时回填
+    this.byteBuf.writeLong(0);
+    // 8 SYSFLAG (4字节) — 含事务类型、V6标志、多TAG标志等
+    this.byteBuf.writeInt(msgInner.getSysFlag());
+    // 9 BORNTIMESTAMP (8字节)
+    this.byteBuf.writeLong(msgInner.getBornTimestamp());
+    // 10 BORNHOST (8字节IPv4 / 20字节IPv6)
+    ByteBuffer bornHostBytes = msgInner.getBornHostBytes();
+    this.byteBuf.writeBytes(bornHostBytes.array());
+    // 11 STORETIMESTAMP (8字节) — 占位，doAppend时回填
+    this.byteBuf.writeLong(msgInner.getStoreTimestamp());
+    // 12 STOREHOSTADDRESS (8字节IPv4 / 20字节IPv6)
+    ByteBuffer storeHostBytes = msgInner.getStoreHostBytes();
+    this.byteBuf.writeBytes(storeHostBytes.array());
+    // 13 RECONSUMETIMES (4字节)
+    this.byteBuf.writeInt(msgInner.getReconsumeTimes());
+    // 14 PreparedTransactionOffset (8字节)
+    this.byteBuf.writeLong(msgInner.getPreparedTransactionOffset());
+    // 15 BODYLENGTH (4字节) + BODY (变长)
+    this.byteBuf.writeInt(bodyLength);
+    if (bodyLength > 0)
+        this.byteBuf.writeBytes(msgInner.getBody());
+    // 16 TOPICLENGTH (1字节V1 / 2字节V2) + TOPIC (变长)
+    if (MessageVersion.MESSAGE_VERSION_V2.equals(msgInner.getVersion())) {
+        this.byteBuf.writeShort((short) topicLength);
+    } else {
+        this.byteBuf.writeByte((byte) topicLength);
+    }
+    this.byteBuf.writeBytes(topicData);
+    // 17 PROPERTIESLENGTH (2字节) + PROPERTIES (变长)
+    this.byteBuf.writeShort((short) propertiesLength);
+    if (propertiesLength > crc32ReservedLength) {
+        this.byteBuf.writeBytes(propertiesData);
+    }
+    // 18 CRC32 (可选，crc32ReservedLength=17字节)
+    this.byteBuf.writerIndex(this.byteBuf.writerIndex() + crc32ReservedLength);
+    
+    return null;  // null表示编码成功
+}
+```
+
+**消息二进制格式总表（calMsgLength 计算依据）：**
+
+```
+偏移   字段名                    大小(字节)     说明
+─────────────────────────────────────────────────────────────────────
+0      TOTALSIZE                 4             消息总长度
+4      MAGICCODE                 4             -626843481(V1) / -626843477(V2)
+8      BODYCRC                   4             消息体CRC32校验
+12     QUEUEID                   4             队列ID
+16     FLAG                      4             消息标志
+20     QUEUEOFFSET               8             队列偏移量（doAppend回填）
+28     PHYSICALOFFSET            8             CommitLog物理偏移（doAppend回填）
+36     SYSFLAG                   4             系统标志（事务/V6/多TAG）
+40     BORNTIMESTAMP             8             产生时间戳
+48     BORNHOST                  8或20          IPv4(4+4) / IPv6(16+4)
+56/68  STORETIMESTAMP            8             存储时间戳（doAppend回填）
+64/76  STOREHOSTADDRESS          8或20          IPv4(4+4) / IPv6(16+4)
+72/96  RECONSUMETIMES            4             重试消费次数
+76/100 PreparedTransactionOffset 8             事务prepared消息偏移
+84/108 BODYLENGTH                4             消息体长度
+88/112 BODY                      bodyLength    消息体内容
+       TOPICLENGTH               1(V1)/2(V2)   Topic长度
+       TOPIC                     topicLength   Topic字符串
+       PROPERTIESLENGTH          2             属性长度
+       PROPERTIES                propertiesLen 属性键值对
+       CRC32                     0或17         CRC32校验（可选）
+```
+
+**calMsgLength 的精确计算逻辑：**
+
+```java
+// MessageExtEncoder.java 行 60-83
+public static int calMsgLength(MessageVersion messageVersion,
+    int sysFlag, int bodyLength, int topicLength, int propertiesLength) {
+    
+    // BORNHOST 和 STOREHOSTADDRESS 的长度取决于 SYSFLAG 中的 V6 标志位
+    int bornhostLength = (sysFlag & MessageSysFlag.BORNHOST_V6_FLAG) == 0 ? 8 : 20;
+    int storehostAddressLength = (sysFlag & MessageSysFlag.STOREHOSTADDRESS_V6_FLAG) == 0 ? 8 : 20;
+    
+    return 4  // TOTALSIZE
+        + 4   // MAGICCODE
+        + 4   // BODYCRC
+        + 4   // QUEUEID
+        + 4   // FLAG
+        + 8   // QUEUEOFFSET
+        + 8   // PHYSICALOFFSET
+        + 4   // SYSFLAG
+        + 8   // BORNTIMESTAMP
+        + bornhostLength          // BORNHOST
+        + 8   // STORETIMESTAMP
+        + storehostAddressLength  // STOREHOSTADDRESS
+        + 4   // RECONSUMETIMES
+        + 8   // PreparedTransactionOffset
+        + 4 + Math.max(bodyLength, 0)         // BODYLENGTH + BODY
+        + messageVersion.getTopicLengthSize() + topicLength  // TOPICLENGTH + TOPIC
+        + 2 + Math.max(propertiesLength, 0);  // PROPERTIESLENGTH + PROPERTIES
+}
+```
+
+IPv4场景下（无V6标志），固定头部为 `4+4+4+4+4+8+8+4+8+8+8+8+4+8+4 = 88` 字节，加上 topic、body、properties 的变长部分。
+
+**第三阶段：DefaultAppendMessageCallback.doAppend() —— 回填与物理写入**
+
+`encode()` 完成后，`asyncPutMessage` 将预编码的 ByteBuf 设置到消息对象上（`msg.setEncodedBuff()`），然后在 `putMessageLock` 内调用 `MappedFile.appendMessage()`，最终进入 `doAppend()`。`doAppend` 的职责是：**回填3个占位字段**，然后将整个预编码缓冲区拷贝到 MappedFile 的 ByteBuffer 中。
+
+```java
+// 源码路径: store/src/main/java/org/apache/rocketmq/store/CommitLog.java
+// 行 1892-2081, DefaultAppendMessageCallback.doAppend
+public AppendMessageResult doAppend(final long fileFromOffset, final ByteBuffer byteBuffer,
+    final int maxBlank, final MessageExtBrokerInner msgInner, PutMessageContext putMessageContext) {
+    
+    // 获取预编码缓冲区
+    ByteBuffer preEncodeBuffer = msgInner.getEncodedBuff();
+    final int msgLen = preEncodeBuffer.getInt(0);  // 读取TOTALSIZE
+    preEncodeBuffer.position(0);
+    preEncodeBuffer.limit(msgLen);
+    
+    // 计算物理偏移 = 文件起始偏移 + 当前写入位置
+    long wroteOffset = fileFromOffset + byteBuffer.position();
+    
+    // 懒构造 msgId（storeHost + wroteOffset 的十六进制表示）
+    Supplier<String> msgIdSupplier = () -> {
+        int msgIdLen = (sysFlag & STOREHOSTADDRESS_V6_FLAG) == 0 ? 16 : 28;
+        ByteBuffer msgIdBuffer = ByteBuffer.allocate(msgIdLen);
+        MessageExt.socketAddress2ByteBuffer(msgInner.getStoreHost(), msgIdBuffer);
+        msgIdBuffer.putLong(msgIdLen - 8, wroteOffset);
+        return UtilAll.bytes2string(msgIdBuffer.array());
+    };
+    
+    Long queueOffset = msgInner.getQueueOffset();
+    
+    // 事务消息特殊处理：PREPARED和ROLLBACK不进入ConsumeQueue
+    final int tranType = MessageSysFlag.getTransactionValue(msgInner.getSysFlag());
+    switch (tranType) {
+        case MessageSysFlag.TRANSACTION_PREPARED_TYPE:
+        case MessageSysFlag.TRANSACTION_ROLLBACK_TYPE:
+            queueOffset = 0L;  // 这些消息不分配queueOffset
+            break;
+    }
+    
+    // ★ 检查剩余空间是否足够（msgLen + 8字节空白标记 > maxBlank）
+    if ((msgLen + END_FILE_MIN_BLANK_LENGTH) > maxBlank) {
+        // 空间不足，写入文件结束标记（BLANK_MAGIC_CODE = -875286124）
+        this.msgStoreItemMemory.clear();
+        this.msgStoreItemMemory.putInt(maxBlank);        // TOTALSIZE = 剩余空间
+        this.msgStoreItemMemory.putInt(CommitLog.BLANK_MAGIC_CODE);  // MAGICCODE
+        byteBuffer.put(this.msgStoreItemMemory.array(), 0, 8);
+        return new AppendMessageResult(AppendMessageStatus.END_OF_FILE, wroteOffset,
+            maxBlank, msgIdSupplier, msgInner.getStoreTimestamp(), queueOffset, 0);
+    }
+    
+    // ★★★ 回填3个占位字段（使用绝对位置put，不改变position）★★★
+    int pos = 4 + 4 + 4 + 4 + 4;  // 跳过 TOTALSIZE, MAGICCODE, BODYCRC, QUEUEID, FLAG = 20字节
+    
+    // 回填 QUEUEOFFSET（偏移量20）
+    preEncodeBuffer.putLong(pos, queueOffset);
+    pos += 8;  // pos = 28
+    
+    // 回填 PHYSICALOFFSET（偏移量28）
+    preEncodeBuffer.putLong(pos, fileFromOffset + byteBuffer.position());
+    pos += 8;  // pos = 36
+    
+    // 跳过 SYSFLAG(4) + BORNTIMESTAMP(8) + BORNHOST(8或20)
+    int ipLen = (sysFlag & BORNHOST_V6_FLAG) == 0 ? 4 + 4 : 16 + 4;
+    pos += 4 + 8 + ipLen;  // pos = 36 + 4 + 8 + 8 = 56 (IPv4)
+    
+    // 回填 STORETIMESTAMP（偏移量56 for IPv4）
+    preEncodeBuffer.putLong(pos, msgInner.getStoreTimestamp());
+    
+    // 可选：计算并回填 CRC32
+    if (enabledAppendPropCRC) {
+        int checkSize = msgLen - crc32ReservedLength;
+        ByteBuffer tmpBuffer = preEncodeBuffer.duplicate();
+        tmpBuffer.limit(tmpBuffer.position() + checkSize);
+        int crc32 = UtilAll.crc32(tmpBuffer);
+        MessageDecoder.createCrc32(tmpBuffer, crc32);
+    }
+    
+    // ★★★ 物理写入：将预编码缓冲区拷贝到 MappedFile 的 ByteBuffer ★★★
+    byteBuffer.put(preEncodeBuffer);
+    msgInner.setEncodedBuff(null);  // 释放引用
+    
+    return new AppendMessageResult(AppendMessageStatus.PUT_OK, wroteOffset, msgLen,
+        msgIdSupplier, msgInner.getStoreTimestamp(), queueOffset, 0, messageNum);
+}
+```
+
+**doAppend 的三个关键回填点总结：**
+
+```
+回填字段          在preEncodeBuffer中的偏移    值来源
+────────────────────────────────────────────────────────────────────
+QUEUEOFFSET       20                          msgInner.getQueueOffset()
+                                               （asyncPutMessage第8步通过assignOffset分配）
+PHYSICALOFFSET    28                          fileFromOffset + byteBuffer.position()
+                                               （文件起始偏移 + 当前写入位置）
+STORETIMESTAMP    56(IPv4)/68(IPv6)           msgInner.getStoreTimestamp()
+                                               （在putMessageLock内重新设置，保证全局有序）
+```
+
+为什么 QUEUEOFFSET 和 PHYSICALOFFSET 在 encode 阶段写 0？因为 encode 在 `putMessageLock` 之外执行（为了减少锁持有时间），此时还不知道物理偏移量。STORETIMESTAMP 在锁内重新设置是为了保证消息在 CommitLog 中的存储时间戳单调递增。
+
+**第四阶段：MappedFile 的三位置模型**
+
+消息写入 MappedFile 后，数据流向涉及三个位置指针：`wrotePosition`、`committedPosition`、`flushedPosition`。它们的关系取决于是否启用了 TransientStorePool（堆外内存池）。
+
+```java
+// 源码路径: store/src/main/java/org/apache/rocketmq/store/logfile/DefaultMappedFile.java
+// 行 80-82
+protected volatile int wrotePosition;       // 数据写入到缓冲区的位置
+protected volatile int committedPosition;   // 数据从writeBuffer提交到FileChannel的位置
+protected volatile int flushedPosition;     // 数据刷盘到磁盘的位置
+```
+
+**场景A：无 TransientStorePool（默认配置，writeBuffer == null）**
+
+数据直接写入 `mappedByteBuffer`（mmap 映射），无需 commit 步骤：
+
+```
+写入: wrotePosition → mappedByteBuffer (mmap)
+commit(): 直接返回 wrotePosition（no-op）
+flush(): mappedByteBuffer.force() → flushedPosition = wrotePosition
+
+关系: wrotePosition == committedPosition >= flushedPosition
+```
+
+**场景B：有 TransientStorePool（writeBuffer != null）**
+
+数据先写入堆外 `writeBuffer`，再通过 FileChannel 提交，最后刷盘：
+
+```
+写入: wrotePosition → writeBuffer (堆外ByteBuffer)
+commit(): writeBuffer[committed..wrote] → FileChannel.write() → committedPosition = wrotePosition
+flush(): fileChannel.force(false) → flushedPosition = committedPosition
+
+关系: wrotePosition >= committedPosition >= flushedPosition
+```
+
+`appendMessagesInner` 的核心逻辑——获取当前写入位置，切片 ByteBuffer，调用 `doAppend`，然后递增 `wrotePosition`：
+
+```java
+// DefaultMappedFile.java 行 351-422
+public AppendMessageResult appendMessagesInner(final MessageExt messageExt,
+    final AppendMessageCallback cb, PutMessageContext putMessageContext) {
+    
+    int currentPos = WROTE_POSITION_UPDATER.get(this);  // 当前写入位置
+    long fileFromOffset = this.getFileFromOffset();
+    
+    if (currentPos < this.fileSize) {
+        // 切片ByteBuffer，定位到currentPos
+        ByteBuffer byteBuffer = appendMessageBuffer().slice();
+        byteBuffer.position(currentPos);
+        
+        // 调用doAppend，maxBlank = fileSize - currentPos
+        AppendMessageResult result;
+        if (messageExt instanceof MessageExtBrokerInner) {
+            result = cb.doAppend(fileFromOffset, byteBuffer, this.fileSize - currentPos,
+                (MessageExtBrokerInner) messageExt, putMessageContext);
+        }
+        
+        // 递增 wrotePosition
+        WROTE_POSITION_UPDATER.addAndGet(this, result.getWroteBytes());
+        return result;
+    }
+    return new AppendMessageResult(AppendMessageStatus.UNKNOWN_ERROR);
+}
+
+// appendMessageBuffer: 返回writeBuffer（如果TransientStorePool启用）或mappedByteBuffer
+protected ByteBuffer appendMessageBuffer() {
+    return writeBuffer != null ? writeBuffer : this.mappedByteBuffer;
+}
+```
+
+**commit0()：从 writeBuffer 到 FileChannel 的数据搬运**
+
+```java
+// DefaultMappedFile.java 行 589-605
+protected void commit0() {
+    int writePos = WROTE_POSITION_UPDATER.get(this);
+    int lastCommittedPosition = COMMITTED_POSITION_UPDATER.get(this);
+    
+    if (writePos - lastCommittedPosition > 0) {
+        ByteBuffer byteBuffer = writeBuffer.slice();
+        byteBuffer.position(lastCommittedPosition);
+        byteBuffer.limit(writePos);
+        this.fileChannel.position(lastCommittedPosition);
+        this.fileChannel.write(byteBuffer);
+        COMMITTED_POSITION_UPDATER.set(this, writePos);
+    }
+}
+```
+
+**flush()：强制刷盘**
+
+```java
+// DefaultMappedFile.java 行 526-559
+public int flush(final int flushLeastPages) {
+    if (this.isAbleToFlush(flushLeastPages)) {
+        if (this.hold()) {
+            int value = getReadPosition();  // 无TSP: wrotePosition; 有TSP: committedPosition
+            
+            if (writeWithoutMmap || writeBuffer != null || fileChannel.position() != 0) {
+                this.fileChannel.force(false);  // 通过FileChannel刷盘
+            } else {
+                this.mappedByteBuffer.force();  // 通过mmap刷盘
+            }
+            
+            FLUSHED_POSITION_UPDATER.set(this, value);
+        }
+    }
+    return this.getFlushedPosition();
+}
+```
+
+`isAbleToFlush` 和 `isAbleToCommit` 都基于页大小（OS_PAGE_SIZE = 4KB）进行阈值判断，只有积攒了足够多的脏页才触发刷盘/提交，避免频繁 I/O。
+
+**MessageExtBrokerInner 的继承链与扩展字段：**
+
+```
+Message (topic, flag, properties, body, transactionId)
+  └── MessageExt (brokerName, queueId, storeSize, queueOffset, sysFlag,
+                  bornTimestamp, bornHost, storeTimestamp, storeHost,
+                  msgId, commitLogOffset, bodyCRC, reconsumeTimes,
+                  preparedTransactionOffset)
+        └── MessageExtBrokerInner (propertiesString, tagsCode, encodedBuff,
+                                    encodeCompleted, version)
+```
+
+`MessageExtBrokerInner` 相比 `MessageExt` 额外增加了：
+- `propertiesString`：properties Map 的序列化字符串形式，直接写入磁盘
+- `tagsCode`：tags 的 hashCode，存入 ConsumeQueue 用于快速过滤
+- `encodedBuff`：预编码后的 ByteBuffer，由 encoder 生成、doAppend 消费
+- `version`：MESSAGE_VERSION_V1 或 V2，控制 magic code 和 topic 长度字段大小
+
+写入成功后，`ReputMessageService` 异步将消息分发到 ConsumeQueue 和 IndexFile。
 
 **步骤7：`handlePutMessageResult`** 根据 `PutMessageStatus` 构建响应：
 - `PUT_OK`：返回 `SEND_OK`
@@ -8336,6 +8832,356 @@ class ConsumeRequest implements Runnable {
     }
 }
 ```
+
+### 1.3.4 Broker 端拉取处理与长轮询机制（PullMessageProcessor + PullRequestHoldService）
+
+当 Consumer 发送 `PULL_MESSAGE` 请求到 Broker 后，`PullMessageProcessor` 负责处理。这条链路涉及消息查找、过滤、以及当没有消息时的长轮询挂起机制。
+
+**PullMessageProcessor.processRequest：验证与消息查找**
+
+```java
+// 源码路径: broker/src/main/java/org/apache/rocketmq/broker/processor/PullMessageProcessor.java
+// 行 304-610
+private RemotingCommand processRequest(final Channel channel, RemotingCommand request,
+    boolean brokerAllowSuspend, boolean brokerAllowFlowCtrSuspend) {
+    
+    final PullMessageRequestHeader requestHeader = ...;
+    final ResponseCode subscriptionConfig = ...;
+    
+    // 1. 验证消费组配置
+    SubscriptionGroupConfig subscriptionGroupConfig = 
+        this.brokerController.getSubscriptionGroupManager().findSubscriptionGroupConfig(group);
+    if (null == subscriptionGroupConfig) {
+        response.setCode(ResponseCode.SUBSCRIPTION_GROUP_NOT_EXIST);
+        return response;
+    }
+    
+    // 2. 获取或构建订阅信息
+    // 两种来源：请求中携带(hasSubscriptionFlag) 或 Broker端ConsumerGroupInfo缓存
+    if (hasSubscriptionFlag) {
+        subscriptionData = FilterAPI.build(topic, subscription, expressionType);
+        if (!ExpressionType.isTagType(subscriptionData.getExpressionType())) {
+            consumerFilterData = ConsumerFilterManager.build(...);
+        }
+    } else {
+        ConsumerGroupInfo consumerGroupInfo = 
+            this.brokerController.getConsumerManager().getConsumerGroupInfo(group);
+        subscriptionData = consumerGroupInfo.findSubscriptionData(topic);
+        // 版本校验、过滤数据校验...
+    }
+    
+    // 3. 构建消息过滤器（两种实现）
+    MessageFilter messageFilter;
+    if (this.brokerController.getBrokerConfig().isFilterSupportRetry()) {
+        messageFilter = new ExpressionForRetryMessageFilter(subscriptionData, consumerFilterData, ...);
+    } else {
+        messageFilter = new ExpressionMessageFilter(subscriptionData, consumerFilterData, ...);
+    }
+    
+    // 4. ★ 调用 store.getMessageAsync 查找消息
+    messageStore.getMessageAsync(group, storeTopic, queueId, requestHeader.getQueueOffset(),
+            requestHeader.getMaxMsgNums(), messageFilter)
+        .thenApply(result -> {
+            // 5. 委托给 pullMessageResultHandler 处理结果
+            return pullMessageResultHandler.handle(result, request, requestHeader, channel,
+                finalSubscriptionData, subscriptionGroupConfig, brokerAllowSuspend,
+                messageFilter, finalResponse, mappingContext, beginTimeMills);
+        });
+}
+```
+
+**DefaultMessageStore.getMessage：从 ConsumeQueue 查找消息并读取 CommitLog**
+
+```java
+// 源码路径: store/src/main/java/org/apache/rocketmq/store/DefaultMessageStore.java
+// 行 865-1062
+public GetMessageResult getMessage(final String group, final String topic,
+    final int queueId, final long offset, final int maxMsgNums,
+    final int maxTotalMsgSize, final MessageFilter messageFilter) {
+    
+    // 1. 定位 ConsumeQueue
+    ConsumeQueueInterface consumeQueue = findConsumeQueue(topic, queueId);
+    minOffset = consumeQueue.getMinOffsetInQueue();
+    maxOffset = consumeQueue.getMaxOffsetInQueue();
+    
+    // 2. 偏移量边界检查
+    if (offset < minOffset) {
+        status = GetMessageStatus.OFFSET_TOO_SMALL;
+        nextBeginOffset = minOffset;
+    } else if (offset == maxOffset) {
+        status = GetMessageStatus.OFFSET_OVERFLOW_ONE;
+        nextBeginOffset = offset;
+    } else if (offset > maxOffset) {
+        status = GetMessageStatus.OFFSET_OVERFLOW_BADLY;
+        nextBeginOffset = maxOffset;
+    } else {
+        // 3. ★ 从 ConsumeQueue 迭代读取 CqUnit
+        ReferredIterator<CqUnit> bufferConsumeQueue = 
+            consumeQueue.iterateFrom(nextBeginOffset, maxMsgNums);
+        
+        while (bufferConsumeQueue.hasNext() && nextBeginOffset < maxOffset) {
+            CqUnit cqUnit = bufferConsumeQueue.next();
+            long offsetPy = cqUnit.getPos();    // CommitLog物理偏移
+            int sizePy = cqUnit.getSize();       // 消息大小
+            
+            // 4. ★ 第一阶段过滤：ConsumeQueue级别（tagsCode快速过滤）
+            if (messageFilter != null
+                && !messageFilter.isMatchedByConsumeQueue(
+                    cqUnit.getValidTagsCodeAsLong(), cqUnit.getCqExtUnit())) {
+                continue;  // 不匹配，跳过（不读取CommitLog）
+            }
+            
+            // 5. 从 CommitLog 读取消息
+            SelectMappedBufferResult selectResult = this.commitLog.getMessage(offsetPy, sizePy);
+            if (null == selectResult) {
+                // 消息已被删除（MappedFile过期），跳到下一个文件
+                nextPhyFileStartOffset = this.commitLog.rollNextFile(offsetPy);
+                continue;
+            }
+            
+            // 6. ★ 第二阶段过滤：CommitLog级别（表达式精确过滤）
+            if (messageFilter != null
+                && !messageFilter.isMatchedByCommitLog(
+                    selectResult.getByteBuffer().slice(), null)) {
+                selectResult.release();
+                filterMessageCount++;
+                continue;
+            }
+            
+            // 7. 匹配成功，加入结果
+            getResult.addMessage(selectResult, cqUnit.getQueueOffset(), cqUnit.getBatchNum());
+            status = GetMessageStatus.FOUND;
+            
+            // 8. 批量大小/总大小限制检查
+            if (isTheBatchFull(sizePy, batchNum, maxMsgNums, maxPullSize, ...)) {
+                break;
+            }
+        }
+    }
+    
+    getResult.setStatus(status);
+    getResult.setNextBeginOffset(nextBeginOffset);
+    getResult.setMaxOffset(maxOffset);
+    getResult.setMinOffset(minOffset);
+    return getResult;
+}
+```
+
+**长轮询：当没有消息时挂起请求**
+
+当 `getMessage` 返回 `NO_MESSAGE_IN_QUEUE` 或 `OFFSET_OVERFLOW_ONE` 等状态时，`DefaultPullMessageResultHandler` 将请求挂起到 `PullRequestHoldService`：
+
+```java
+// 源码路径: broker/src/main/java/org/apache/rocketmq/broker/processor/DefaultPullMessageResultHandler.java
+// 行 172-188
+case ResponseCode.PULL_NOT_FOUND:
+    final boolean hasSuspendFlag = PullSysFlag.hasSuspendFlag(requestHeader.getSysFlag());
+    final long suspendTimeoutMillisLong = hasSuspendFlag ? requestHeader.getSuspendTimeoutMillis() : 0;
+    
+    if (brokerAllowSuspend && hasSuspendFlag) {
+        long pollingTimeMills = suspendTimeoutMillisLong;
+        if (!this.brokerController.getBrokerConfig().isLongPollingEnable()) {
+            // 长轮询未启用，使用短轮询超时（默认1秒）
+            pollingTimeMills = this.brokerController.getBrokerConfig().getShortPollingTimeMills();
+        }
+        
+        // 创建挂起的PullRequest
+        PullRequest pullRequest = new PullRequest(request, channel, pollingTimeMills,
+            this.brokerController.getMessageStore().now(), offset, subscriptionData, messageFilter);
+        // ★ 挂起到 PullRequestHoldService
+        this.brokerController.getPullRequestHoldService()
+            .suspendPullRequest(topic, queueId, pullRequest);
+        return null;  // ★ 不发送响应！请求被挂起
+    }
+```
+
+关键点：`brokerAllowSuspend` 在首次调用时为 `true`，但在 `executeRequestWhenWakeup` 重新执行时为 `false`，确保被唤醒的请求不会被再次挂起。
+
+**PullRequestHoldService：挂起请求的存储与唤醒**
+
+```java
+// 源码路径: broker/src/main/java/org/apache/rocketmq/broker/longpolling/PullRequestHoldService.java
+
+// 数据结构：topic@queueId → ManyPullRequest（synchronized ArrayList）
+protected ConcurrentMap<String, ManyPullRequest> pullRequestTable = new ConcurrentHashMap<>(1024);
+
+// 挂起请求
+public void suspendPullRequest(final String topic, final int queueId, final PullRequest pullRequest) {
+    String key = this.buildKey(topic, queueId);  // "topic@queueId"
+    ManyPullRequest mpr = this.pullRequestTable.get(key);
+    if (null == mpr) {
+        mpr = new ManyPullRequest();
+        ManyPullRequest prev = this.pullRequestTable.putIfAbsent(key, mpr);
+        if (prev != null) { mpr = prev; }
+    }
+    pullRequest.getRequestCommand().setSuspended(true);
+    mpr.addPullRequest(pullRequest);
+}
+
+// 主循环：每5秒检查一次所有挂起的请求
+@Override
+public void run() {
+    while (!this.isStopped()) {
+        if (this.brokerController.getBrokerConfig().isLongPollingEnable()) {
+            this.waitForRunning(5 * 1000);  // 5秒
+        } else {
+            this.waitForRunning(this.brokerController.getBrokerConfig().getShortPollingTimeMills());
+        }
+        this.checkHoldRequest();
+    }
+}
+
+// 检查并唤醒
+protected void checkHoldRequest() {
+    for (String key : this.pullRequestTable.keySet()) {
+        String[] kArray = key.split(TOPIC_QUEUEID_SEPARATOR);
+        String topic = kArray[0];
+        int queueId = Integer.parseInt(kArray[1]);
+        final long offset = this.brokerController.getMessageStore().getMaxOffsetInQueue(topic, queueId);
+        this.notifyMessageArriving(topic, queueId, offset);
+    }
+}
+
+// ★ 核心唤醒逻辑
+public void notifyMessageArriving(final String topic, final int queueId, final long maxOffset,
+    final Long tagsCode, long msgStoreTime, byte[] filterBitMap, Map<String, String> properties) {
+    
+    String key = this.buildKey(topic, queueId);
+    ManyPullRequest mpr = this.pullRequestTable.get(key);
+    if (mpr != null) {
+        List<PullRequest> requestList = mpr.cloneListAndClear();
+        if (requestList != null) {
+            List<PullRequest> replayList = new ArrayList<>();
+            
+            for (PullRequest request : requestList) {
+                long newestOffset = maxOffset;
+                if (newestOffset <= request.getPullFromThisOffset()) {
+                    newestOffset = this.brokerController.getMessageStore()
+                        .getMaxOffsetInQueue(topic, queueId);
+                }
+                
+                if (newestOffset > request.getPullFromThisOffset()) {
+                    // ★ 有新消息！检查过滤器
+                    boolean match = request.getMessageFilter().isMatchedByConsumeQueue(tagsCode, ...);
+                    if (match && properties != null) {
+                        match = request.getMessageFilter().isMatchedByCommitLog(null, properties);
+                    }
+                    
+                    if (match) {
+                        // ★ 唤醒：重新执行拉取请求
+                        this.brokerController.getPullMessageProcessor()
+                            .executeRequestWhenWakeup(request.getClientChannel(), request.getRequestCommand());
+                        continue;
+                    }
+                }
+                
+                // 超时检查
+                if (System.currentTimeMillis() >= 
+                    (request.getSuspendTimestamp() + request.getTimeoutMillis())) {
+                    // ★ 超时唤醒：重新执行（会返回PULL_NOT_FOUND给客户端）
+                    this.brokerController.getPullMessageProcessor()
+                        .executeRequestWhenWakeup(request.getClientChannel(), request.getRequestCommand());
+                    continue;
+                }
+                
+                // 未到期且无新消息：放回继续等待
+                replayList.add(request);
+            }
+            
+            if (!replayList.isEmpty()) {
+                mpr.addPullRequest(replayList);
+            }
+        }
+    }
+}
+```
+
+**ReputMessageService：实时触发长轮询唤醒**
+
+除了 `PullRequestHoldService` 每5秒的定时检查外，`ReputMessageService` 每1毫秒扫描 CommitLog，当新消息被分发到 ConsumeQueue 时立即触发唤醒：
+
+```java
+// 源码路径: store/src/main/java/org/apache/rocketmq/store/DefaultMessageStore.java
+// ReputMessageService.doReput(), 行 2711-2789
+public void doReput() {
+    for (boolean doNext = true; isCommitLogAvailable() && doNext; ) {
+        SelectMappedBufferResult result = DefaultMessageStore.this.commitLog.getData(reputFromOffset);
+        
+        for (int readSize = 0; readSize < result.getSize() && doNext; ) {
+            DispatchRequest dispatchRequest =
+                DefaultMessageStore.this.commitLog.checkMessageAndReturnSize(result.getByteBuffer(), ...);
+            
+            if (dispatchRequest.isSuccess() && size > 0) {
+                // 1. 分发到 ConsumeQueue 和 IndexFile
+                DefaultMessageStore.this.doDispatch(dispatchRequest);
+                
+                // 2. ★ 如果启用长轮询，立即通知
+                if (isNotifyMessageArriveWhenReput()) {
+                    notifyMessageArriveIfNecessary(dispatchRequest);
+                }
+                
+                this.reputFromOffset += size;
+                readSize += size;
+            }
+        }
+    }
+}
+
+// notifyMessageArriveIfNecessary: 通过监听器触发 PullRequestHoldService
+@Override
+public void notifyMessageArriveIfNecessary(DispatchRequest dispatchRequest) {
+    if (DefaultMessageStore.this.brokerConfig.isLongPollingEnable()
+        && DefaultMessageStore.this.messageArrivingListener != null) {
+        DefaultMessageStore.this.messageArrivingListener.arriving(
+            dispatchRequest.getTopic(),
+            dispatchRequest.getQueueId(),
+            dispatchRequest.getConsumeQueueOffset() + 1,  // 新消息的offset
+            dispatchRequest.getTagsCode(),
+            dispatchRequest.getStoreTimestamp(),
+            dispatchRequest.getBitMap(),
+            dispatchRequest.getPropertiesMap());
+    }
+}
+
+// NotifyMessageArrivingListener: 桥接到 PullRequestHoldService
+public void arriving(String topic, int queueId, long logicOffset, long tagsCode,
+    long msgStoreTime, byte[] filterBitMap, Map<String, String> properties) {
+    this.pullRequestHoldService.notifyMessageArriving(
+        topic, queueId, logicOffset, tagsCode, msgStoreTime, filterBitMap, properties);
+}
+```
+
+**长轮询的完整生命周期：**
+
+```
+1. Consumer 发送 PULL_MESSAGE → PullMessageProcessor
+2. PullMessageProcessor 调用 getMessage → 无消息 → PULL_NOT_FOUND
+3. DefaultPullMessageResultHandler 挂起请求到 PullRequestHoldService
+   → 返回 null（不发送响应）
+   → Consumer 的 Netty 客户端在等待响应
+
+4. 【唤醒路径A — 实时（1ms延迟）】
+   ReputMessageService.doReput() 发现新消息
+   → notifyMessageArriveIfNecessary
+   → NotifyMessageArrivingListener.arriving()
+   → PullRequestHoldService.notifyMessageArriving()
+   → 检查 offset 和过滤器
+   → executeRequestWhenWakeup() 重新执行 processRequest
+   → brokerAllowSuspend=false → 有消息返回 FOUND，无消息返回 PULL_NOT_FOUND
+
+5. 【唤醒路径B — 定时（5秒）】
+   PullRequestHoldService.run() 每5秒
+   → checkHoldRequest() 遍历所有挂起请求
+   → notifyMessageArriving() 检查 offset 和超时
+   → 超时的请求执行 executeRequestWhenWakeup()
+
+6. executeRequestWhenWakeup:
+   processRequest(channel, request, false, brokerAllowFlowCtrSuspend)
+   → brokerAllowSuspend=false，不会再挂起
+   → 返回响应给 Consumer
+```
+
+这种设计使得 Consumer 在没有新消息时不会频繁空轮询（减少网络开销），同时在新消息到达时能在1ms内被唤醒（保证低延迟）。默认挂起超时为15秒（由客户端 `suspendTimeoutMillis` 控制），超时后返回 `PULL_NOT_FOUND`，Consumer 会立即重新发起拉取。
 
 ### 1.4 完整时序图
 
@@ -8596,6 +9442,149 @@ class ConsumeRequest implements Runnable {
                     }
                 }
             } else {
+
+#### 2.3.2b processConsumeResult：顺序消费结果处理（真实源码）
+
+`processConsumeResult` 是顺序消费中处理消费结果的核心方法，根据 `autoCommit` 和 `ConsumeOrderlyStatus` 的不同组合，走不同的分支：
+
+```java
+// 源码路径: client/src/main/java/org/apache/rocketmq/client/impl/consumer/ConsumeMessageOrderlyService.java
+// 行 274-345
+public boolean processConsumeResult(
+    final List<MessageExt> msgs,
+    final ConsumeOrderlyStatus status,
+    final ConsumeOrderlyContext context,
+    final ConsumeRequest consumeRequest) {
+    
+    boolean continueConsume = true;
+    long commitOffset = -1L;
+    
+    if (context.isAutoCommit()) {
+        // ========== autoCommit == true 分支 ==========
+        switch (status) {
+            case COMMIT:
+            case ROLLBACK:
+                // ★ 警告：autoCommit模式下COMMIT和ROLLBACK是非法的，当作SUCCESS处理
+                log.warn("the message queue consume result is illegal, we think you want to ack these message {}",
+                    consumeRequest.getMessageQueue());
+            case SUCCESS:
+                // 消费成功，提交 ProcessQueue 中的消息
+                commitOffset = consumeRequest.getProcessQueue().commit();
+                this.getConsumerStatsManager().incConsumeOKTPS(consumerGroup, 
+                    consumeRequest.getMessageQueue().getTopic(), msgs.size());
+                break;
+            case SUSPEND_CURRENT_QUEUE_A_MOMENT:
+                // ★ 消费失败，暂停当前队列
+                this.getConsumerStatsManager().incConsumeFailedTPS(consumerGroup,
+                    consumeRequest.getMessageQueue().getTopic(), msgs.size());
+                if (checkReconsumeTimes(msgs)) {
+                    // 重试次数未超限：将消息放回 ProcessQueue 待消费
+                    consumeRequest.getProcessQueue().makeMessageToConsumeAgain(msgs);
+                    // 延迟后重新提交消费请求
+                    this.submitConsumeRequestLater(
+                        consumeRequest.getProcessQueue(),
+                        consumeRequest.getMessageQueue(),
+                        context.getSuspendCurrentQueueTimeMillis());
+                    continueConsume = false;  // 暂停消费循环
+                } else {
+                    // ★ 重试次数超限：直接提交（相当于ACK，消息不再重试）
+                    commitOffset = consumeRequest.getProcessQueue().commit();
+                }
+                break;
+            default:
+                break;
+        }
+    } else {
+        // ========== autoCommit == false 分支（手动提交） ==========
+        switch (status) {
+            case SUCCESS:
+                // 不自动提交，由用户通过 context.commit() 手动提交
+                this.getConsumerStatsManager().incConsumeOKTPS(consumerGroup, 
+                    consumeRequest.getMessageQueue().getTopic(), msgs.size());
+                break;
+            case COMMIT:
+                // 用户显式提交
+                commitOffset = consumeRequest.getProcessQueue().commit();
+                break;
+            case ROLLBACK:
+                // 回滚 ProcessQueue
+                consumeRequest.getProcessQueue().rollback();
+                this.submitConsumeRequestLater(
+                    consumeRequest.getProcessQueue(),
+                    consumeRequest.getMessageQueue(),
+                    context.getSuspendCurrentQueueTimeMillis());
+                continueConsume = false;
+                break;
+            case SUSPEND_CURRENT_QUEUE_A_MOMENT:
+                this.getConsumerStatsManager().incConsumeFailedTPS(consumerGroup,
+                    consumeRequest.getMessageQueue().getTopic(), msgs.size());
+                if (checkReconsumeTimes(msgs)) {
+                    consumeRequest.getProcessQueue().makeMessageToConsumeAgain(msgs);
+                    this.submitConsumeRequestLater(
+                        consumeRequest.getProcessQueue(),
+                        consumeRequest.getMessageQueue(),
+                        context.getSuspendCurrentQueueTimeMillis());
+                    continueConsume = false;
+                }
+                // ★ 手动模式下重试超限：什么都不做（消息既不提交也不回滚）
+                // 这意味着消息会留在 consumingMsgOrderlyTreeMap 中
+                break;
+            default:
+                break;
+        }
+    }
+    
+    // 更新消费 offset
+    if (commitOffset >= 0 && !consumeRequest.getProcessQueue().isDropped()) {
+        this.defaultMQPushConsumerImpl.getOffsetStore().updateOffset(
+            consumeRequest.getMessageQueue(), commitOffset, false);
+    }
+    
+    return continueConsume;
+}
+```
+
+**checkReconsumeTimes：顺序消费的重试次数控制**
+
+```java
+// 行 360-377
+private boolean checkReconsumeTimes(List<MessageExt> msgs) {
+    boolean suspend = false;
+    if (msgs != null && !msgs.isEmpty()) {
+        for (MessageExt msg : msgs) {
+            if (msg.getReconsumeTimes() >= getMaxReconsumeTimes()) {
+                // ★ 超过最大重试次数 → 发送到重试Topic（%RETRY%group）
+                MessageAccessor.setReconsumeTime(msg, String.valueOf(msg.getReconsumeTimes()));
+                if (!sendMessageBack(msg)) {
+                    // 发回失败 → 继续本地暂停重试
+                    suspend = true;
+                    msg.setReconsumeTimes(msg.getReconsumeTimes() + 1);
+                }
+                // 发回成功 → suspend=false，消息被ACK（不再本地重试）
+            } else {
+                // 未超限 → 本地暂停重试
+                suspend = true;
+                msg.setReconsumeTimes(msg.getReconsumeTimes() + 1);
+            }
+        }
+    }
+    return suspend;
+}
+
+// 默认最大重试次数：Integer.MAX_VALUE（无限重试）
+private int getMaxReconsumeTimes() {
+    if (this.defaultMQPushConsumer.getMaxReconsumeTimes() == -1) {
+        return Integer.MAX_VALUE;  // ★ 顺序消费默认无限重试！
+    }
+    return this.defaultMQPushConsumer.getMaxReconsumeTimes();
+}
+```
+
+**顺序消费与并发消费的关键区别：**
+- 顺序消费默认无限重试（`Integer.MAX_VALUE`），而并发消费默认16次
+- 顺序消费的 `sendMessageBack` 将消息发到 `%RETRY%group` 并设置递增延时级别（`3 + reconsumeTimes`），与并发消费的重试机制殊途同归
+- 顺序消费在 `SUSPEND_CURRENT_QUEUE_A_MOMENT` 时，消息被放回 `consumingMsgOrderlyTreeMap`（通过 `makeMessageToConsumeAgain`），而不是发回 Broker
+- 只有当重试次数超限且 `sendMessageBack` 成功时，消息才被 ACK 并离开本地队列
                 tryLockLaterAndReconsume(this.messageQueue, this.processQueue, 100);
             }
         }
@@ -8951,7 +9940,144 @@ public synchronized void persist() {
 }
 ```
 
-Broker 重启时会从 `delayOffset.json` 恢复每个延时级别的处理进度，避免重复投递。
+**Broker 重启恢复：ScheduleMessageService 的 load / start / correctDelayOffset 全流程**
+
+`ScheduleMessageService` 继承 `ConfigManager`，其持久化文件为 `delayOffset.json`。Broker 重启时的完整恢复链路如下：
+
+```java
+// 源码路径: broker/src/main/java/org/apache/rocketmq/broker/schedule/ScheduleMessageService.java
+// 行 135-166, start()方法
+public void start() {
+    // 1. ★ 从 delayOffset.json 加载持久化的 offsetTable
+    this.load();  
+    
+    // 2. 为每个延时级别创建 DeliverDelayedMessageTimerTask
+    for (int i = 1; i <= this.maxDelayLevel; i++) {
+        Long offset = this.offsetTable.get(i);
+        if (offset == null) {
+            this.offsetTable.put(i, 0L);
+            offset = 0L;
+        }
+        
+        if (isSyncDeliver) {
+            // 同步投递模式
+            this.deliverExecutorService.scheduleAtFixedRate(
+                new DeliverDelayedMessageTimerTask(i, offset),
+                FIRST_DELAY_TIME,  // 1000ms 初始延迟
+                ...);
+        } else {
+            // 异步投递模式（默认）
+            this.deliverExecutorService.scheduleAtFixedRate(
+                new DeliverDelayedMessageTimerTask(i, offset),
+                FIRST_DELAY_TIME,
+                ...);
+            // 额外启动 HandlePutResultTask 处理异步投递结果
+            this.handleExecutorService.scheduleAtFixedRate(
+                new HandlePutResultTask(i),
+                FIRST_DELAY_TIME,
+                ...);
+        }
+    }
+    
+    // 3. 启动定时持久化任务
+    this.scheduledPersistService = new ScheduledExecutorService...
+    this.scheduledPersistService.scheduleAtFixedRate(() -> {
+        ScheduleMessageService.this.persist();
+    }, 10000, this.flushDelayOffsetInterval, TimeUnit.MILLISECONDS);
+}
+```
+
+**load()：三步恢复链路**
+
+```java
+// 行 222-227
+public boolean load() {
+    boolean result = super.load();          // ConfigManager: 读取 delayOffset.json
+    result = result && this.parseDelayLevel();   // 解析 messageDelayLevel 配置
+    result = result && this.correctDelayOffset(); // 修正偏移量到合法范围
+    return result;
+}
+```
+
+**ConfigManager.load()** 读取 `delayOffset.json` 文件内容（若不存在则尝试 `.bak` 文件），然后调用 `decode(jsonString)` 反序列化：
+
+```java
+// 行 277-290
+public void decode(String jsonString) {
+    if (jsonString != null) {
+        DelayOffsetSerializeWrapper wrapper = 
+            DelayOffsetSerializeWrapper.fromJson(jsonString, DelayOffsetSerializeWrapper.class);
+        if (wrapper != null) {
+            // ★ 恢复 level → consume offset 映射
+            this.offsetTable.putAll(wrapper.getOffsetTable());
+            if (wrapper.getDataVersion() != null) {
+                this.dataVersion.assignNewOne(wrapper.getDataVersion());
+            }
+        }
+    }
+}
+```
+
+**correctDelayOffset()：修正偏移量到合法范围**
+
+Broker 重启后，CommitLog 可能已被清理过期的 MappedFile，导致 ConsumeQueue 的 `[minOffset, maxOffset]` 范围变化。`correctDelayOffset` 将每个级别的 offset 钳制到实际范围内：
+
+```java
+// 行 235-269
+private boolean correctDelayOffset() {
+    for (int delayLevel : this.delayLevelTable.keySet()) {
+        ConsumeQueueInterface cq = defaultMessageStore.getConsumeQueue(
+            TopicValidator.RMQ_SYS_SCHEDULE_TOPIC, delayLevel - 1);
+        
+        if (cq != null) {
+            Long currOffset = this.offsetTable.get(delayLevel);
+            if (currOffset < cq.getMinOffsetInQueue()) {
+                // offset 小于最小值（消息已被清理），修正到最小值
+                this.offsetTable.put(delayLevel, cq.getMinOffsetInQueue());
+            } else if (currOffset > cq.getMaxOffsetInQueue()) {
+                // offset 大于最大值（异常），修正到最大值
+                this.offsetTable.put(delayLevel, cq.getMaxOffsetInQueue());
+            }
+        }
+    }
+    return true;
+}
+```
+
+**shutdown / stop()：关闭时的 at-least-once 语义保证**
+
+```java
+// 行 173-198
+public boolean stop() {
+    if (this.started.compareAndSet(true, false) && null != this.deliverExecutorService) {
+        // 1. 关闭线程池，等待最多5秒
+        this.deliverExecutorService.shutdown();
+        this.deliverExecutorService.awaitTermination(WAIT_FOR_SHUTDOWN, TimeUnit.MILLISECONDS); // 5000ms
+        
+        if (this.handleExecutorService != null) {
+            this.handleExecutorService.shutdown();
+            this.handleExecutorService.awaitTermination(WAIT_FOR_SHUTDOWN, TimeUnit.MILLISECONDS);
+        }
+        
+        // 2. 记录未完成的异步投递任务数量（仅日志，不持久化）
+        for (int i = 1; i <= this.deliverPendingTable.size(); i++) {
+            log.warn("deliverPendingTable level: {}, size: {}", i, this.deliverPendingTable.get(i).size());
+        }
+        
+        // 3. ★ 持久化 offsetTable 到 delayOffset.json
+        this.persist();
+    }
+    return true;
+}
+```
+
+**关键边界条件分析：**
+
+投递失败处理：当 `DeliverDelayedMessageTimerTask.executeOnTimeUp` 中 `escapeBridge.asyncPutMessage` 投递失败时，会调用 `scheduleNextTimerTask(currOffset, DELAY_FOR_A_WHILE)`（延迟100ms后重试），不会更新 offset，因此消息不会丢失。
+
+Broker 宕机重启：由于 offset 仅在投递成功后才通过 `updateOffset` 推进，重启后 `load()` 恢复的 offset 指向最后一条已确认投递的消息的下一个位置。未确认的消息会被重新投递，实现 at-least-once 语义。对于异步投递模式，已提交到 `escapeBridge.asyncPutMessage` 但 offset 未及时持久化的消息，重启后会被重复投递。
+
+消息过期跳过：如果延时消息的投递时间远早于当前时间（例如 Broker 长时间宕机后恢复），`correctDeliverTimestamp` 方法会立即投递这些过期消息，而不是按原始延时等待。`deliverTimestamp = now + delayLevel` 的修正逻辑确保不会因为时钟偏差导致无限等待。
 
 ---
 
@@ -9147,50 +10273,285 @@ public static MessageExtBrokerInner parseHalfMessageInner(MessageExtBrokerInner 
 
 半消息的 Topic 被改为 `RMQ_SYS_TRANS_HALF_TOPIC`，消费者不会订阅这个 Topic，因此半消息在事务未确认前对消费者完全不可见。
 
-#### 4.3.3 Broker 端：二次确认处理
+#### 4.3.3 Broker 端：二次确认处理（EndTransactionProcessor 真实源码）
 
-`EndTransactionProcessor` 处理 `END_TRANSACTION` 请求：
+`EndTransactionProcessor` 处理 `END_TRANSACTION` 请求。以下是真实源码的完整分支逻辑：
 
 ```java
-// EndTransactionProcessor.processRequest
+// 源码路径: broker/src/main/java/org/apache/rocketmq/broker/processor/EndTransactionProcessor.java
+// 行 58-190
 public RemotingCommand processRequest(ChannelHandlerContext ctx, RemotingCommand request) {
     final EndTransactionRequestHeader requestHeader = ...;
     
+    // SLAVE节点拒绝处理
+    if (BrokerRole.SLAVE == brokerController.getMessageStoreConfig().getBrokerRole()) {
+        response.setCode(ResponseCode.SLAVE_NOT_AVAILABLE);
+        return response;
+    }
+    
+    // fromTransactionCheck=true 表示这是事务回查的响应
+    // fromTransactionCheck=false 表示这是Producer主动提交的二次确认
+    if (requestHeader.getFromTransactionCheck()) {
+        // 回查响应分支
+        switch (requestHeader.getCommitOrRollback()) {
+            case MessageSysFlag.TRANSACTION_NOT_TYPE:
+                LOGGER.warn("check producer transaction state, but it's not commit or rollback");
+                return null;  // Producer未决定，不处理
+            case MessageSysFlag.TRANSACTION_COMMIT_TYPE:
+                LOGGER.warn("check producer transaction state, the producer commit one message");
+                break;  // 继续走COMMIT逻辑
+            case MessageSysFlag.TRANSACTION_ROLLBACK_TYPE:
+                LOGGER.warn("check producer transaction state, the producer rollback one message");
+                break;  // 继续走ROLLBACK逻辑
+            default:
+                return null;
+        }
+    } else {
+        // Producer主动提交分支
+        switch (requestHeader.getCommitOrRollback()) {
+            case MessageSysFlag.TRANSACTION_NOT_TYPE:
+                LOGGER.warn("producer end transaction, but not commit/rollback");
+                return null;
+            case MessageSysFlag.TRANSACTION_COMMIT_TYPE:
+                break;  // 继续走COMMIT逻辑
+            case MessageSysFlag.TRANSACTION_ROLLBACK_TYPE:
+                LOGGER.warn("producer end transaction rollback");
+                break;  // 继续走ROLLBACK逻辑
+            default:
+                return null;
+        }
+    }
+    
+    // ★ 核心处理逻辑
     OperationResult result = new OperationResult();
     if (MessageSysFlag.TRANSACTION_COMMIT_TYPE == requestHeader.getCommitOrRollback()) {
-        // COMMIT：将半消息恢复并投递到原始Topic
-        result = this.commitMessage(requestHeader);    // 从CommitLog读取半消息
+        // ========== COMMIT 分支 ==========
+        result = this.brokerController.getTransactionalMessageService().commitMessage(requestHeader);
         if (result.getResponseCode() == ResponseCode.SUCCESS) {
-            // 恢复原始Topic
-            MessageExtBrokerInner msgInner = endMessageTransaction(result.getPrepareMessage());
-            // 写入原始Topic
-            SendResult sendResult = this.getBrokerController().getTransactionalMessageService()
-                .deletePrepareMessage(requestHeader);  // 删除半消息（写op记录）
-            // ...
-            RemotingCommand response = ...;
-            response.setCode(ResponseCode.SUCCESS);
-            return response;
+            // 检查是否超时（超过checkImmunityTime的COMMIT被拒绝，改由回查处理）
+            if (rejectCommitOrRollback(requestHeader, result.getPrepareMessage())) {
+                response.setCode(ResponseCode.ILLEGAL_OPERATION);
+                return response;
+            }
+            // 验证半消息完整性
+            RemotingCommand res = checkPrepareMessage(result.getPrepareMessage(), requestHeader);
+            if (res.getCode() == ResponseCode.SUCCESS) {
+                // ★ 恢复原始Topic和QueueId
+                MessageExtBrokerInner msgInner = endMessageTransaction(result.getPrepareMessage());
+                // 重置事务类型为COMMIT
+                msgInner.setSysFlag(MessageSysFlag.resetTransactionValue(
+                    msgInner.getSysFlag(), requestHeader.getCommitOrRollback()));
+                msgInner.setQueueOffset(requestHeader.getTranStateTableOffset());
+                msgInner.setPreparedTransactionOffset(requestHeader.getCommitLogOffset());
+                msgInner.setStoreTimestamp(result.getPrepareMessage().getStoreTimestamp());
+                MessageAccessor.clearProperty(msgInner, MessageConst.PROPERTY_TRANSACTION_PREPARED);
+                
+                // ★ 写入真实消息到CommitLog（投递到原始Topic）
+                RemotingCommand sendResult = sendFinalMessage(msgInner);
+                if (sendResult.getCode() == ResponseCode.SUCCESS) {
+                    // ★ 投递成功后，删除半消息（写op记录）
+                    deletePrepareMessage(result);
+                }
+                return sendResult;
+            }
+            return res;
         }
     } else if (MessageSysFlag.TRANSACTION_ROLLBACK_TYPE == requestHeader.getCommitOrRollback()) {
-        // ROLLBACK：只删除半消息，不投递
-        result = this.commitMessage(requestHeader);
+        // ========== ROLLBACK 分支 ==========
+        result = this.brokerController.getTransactionalMessageService().rollbackMessage(requestHeader);
         if (result.getResponseCode() == ResponseCode.SUCCESS) {
-            this.getBrokerController().getTransactionalMessageService()
-                .deletePrepareMessage(requestHeader);
+            if (rejectCommitOrRollback(requestHeader, result.getPrepareMessage())) {
+                response.setCode(ResponseCode.ILLEGAL_OPERATION);
+                return response;
+            }
+            RemotingCommand res = checkPrepareMessage(result.getPrepareMessage(), requestHeader);
+            if (res.getCode() == ResponseCode.SUCCESS) {
+                // ★ ROLLBACK只删除半消息，不投递（不调用sendFinalMessage）
+                deletePrepareMessage(result);
+            }
+            return res;
         }
-        // ...
     }
+    
+    response.setCode(result.getResponseCode());
+    response.setRemark(result.getResponseRemark());
+    return response;
 }
 ```
 
-**`deletePrepareMessage`：写入 op 标记**
+**COMMIT 和 ROLLBACK 的关键区别：**
+- COMMIT：读取半消息 → `endMessageTransaction` 恢复原始Topic → `sendFinalMessage` 写入CommitLog → `deletePrepareMessage` 写op记录
+- ROLLBACK：读取半消息 → `deletePrepareMessage` 写op记录（不恢复、不投递）
+
+**commitMessage / rollbackMessage：从 CommitLog 读取半消息**
 
 ```java
-// TransactionalMessageServiceImpl.deletePrepareMessage
-// 不是物理删除，而是在 RMQ_SYS_TRANS_OP_HALF_TOPIC 写入一条标记消息
-// 标记内容是半消息的 queueOffset
-// 后续事务回查时检查 op topic 中是否有该 offset 的标记
+// 源码路径: broker/src/main/java/org/apache/rocketmq/broker/transaction/queue/TransactionalMessageServiceImpl.java
+// 行 633-641, 583-594
+public OperationResult commitMessage(EndTransactionRequestHeader requestHeader) {
+    return getHalfMessageByOffset(requestHeader.getCommitLogOffset());
+}
+public OperationResult rollbackMessage(EndTransactionRequestHeader requestHeader) {
+    return getHalfMessageByOffset(requestHeader.getCommitLogOffset());
+}
+
+private OperationResult getHalfMessageByOffset(long commitLogOffset) {
+    OperationResult response = new OperationResult();
+    // 通过物理偏移量直接从CommitLog读取半消息
+    MessageExt messageExt = this.transactionalMessageBridge.lookMessageByOffset(commitLogOffset);
+    if (messageExt != null) {
+        response.setPrepareMessage(messageExt);
+        response.setResponseCode(ResponseCode.SUCCESS);
+        response.setResponseRemark(null);
+    } else {
+        response.setResponseCode(ResponseCode.SYSTEM_ERROR);
+        response.setResponseRemark("Find prepared transaction message failed");
+    }
+    return response;
+}
 ```
+
+**endMessageTransaction：恢复原始Topic和QueueId**
+
+```java
+// EndTransactionProcessor.java 行 266-296
+private MessageExtBrokerInner endMessageTransaction(MessageExt msgExt) {
+    MessageExtBrokerInner msgInner = new MessageExtBrokerInner();
+    // ★ 从properties中恢复原始Topic和QueueId
+    msgInner.setTopic(msgExt.getUserProperty(MessageConst.PROPERTY_REAL_TOPIC));
+    msgInner.setQueueId(Integer.parseInt(msgExt.getUserProperty(MessageConst.PROPERTY_REAL_QUEUE_ID)));
+    msgInner.setBody(msgExt.getBody());
+    msgInner.setFlag(msgExt.getFlag());
+    msgInner.setBornTimestamp(msgExt.getBornTimestamp());
+    msgInner.setBornHost(msgExt.getBornHost());
+    msgInner.setStoreHost(msgExt.getStoreHost());
+    msgInner.setReconsumeTimes(msgExt.getReconsumeTimes());
+    msgInner.setWaitStoreMsgOK(false);
+    msgInner.setTransactionId(msgExt.getUserProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX));
+    msgInner.setSysFlag(msgExt.getSysFlag());
+    
+    TopicFilterType topicFilterType =
+        (msgInner.getSysFlag() & MessageSysFlag.MULTI_TAGS_FLAG) == MessageSysFlag.MULTI_TAGS_FLAG
+            ? TopicFilterType.MULTI_TAG : TopicFilterType.SINGLE_TAG;
+    long tagsCodeValue = MessageExtBrokerInner.tagsString2tagsCode(topicFilterType, msgInner.getTags());
+    msgInner.setTagsCode(tagsCodeValue);
+    
+    // 复制properties并清除REAL_TOPIC/REAL_QUEUE_ID
+    MessageAccessor.setProperties(msgInner,
+        MessageDecoder.string2messageProperties(
+            MessageDecoder.messageProperties2String(msgExt.getProperties())));
+    MessageAccessor.clearProperty(msgInner, MessageConst.PROPERTY_REAL_TOPIC);
+    MessageAccessor.clearProperty(msgInner, MessageConst.PROPERTY_REAL_QUEUE_ID);
+    msgInner.setPropertiesString(MessageDecoder.messageProperties2String(msgInner.getProperties()));
+    return msgInner;
+}
+```
+
+**sendFinalMessage：写入真实消息到 CommitLog**
+
+```java
+// EndTransactionProcessor.java 行 298-371
+private RemotingCommand sendFinalMessage(MessageExtBrokerInner msgInner) {
+    final RemotingCommand response = RemotingCommand.createResponseCommand(null);
+    // 调用store.putMessage写入CommitLog（走正常的asyncPutMessage流程）
+    final PutMessageResult putMessageResult = 
+        this.brokerController.getMessageStore().putMessage(msgInner);
+    if (putMessageResult != null) {
+        switch (putMessageResult.getPutMessageStatus()) {
+            case PUT_OK:
+                // 统计...
+                response.setCode(ResponseCode.SUCCESS);
+                break;
+            case FLUSH_DISK_TIMEOUT:
+            case FLUSH_SLAVE_TIMEOUT:
+            case SLAVE_NOT_AVAILABLE:
+                // ★ 注意：这三种状态也视为SUCCESS（消息已写入，只是刷盘/复制未完成）
+                response.setCode(ResponseCode.SUCCESS);
+                break;
+            // 其他失败状态映射到对应错误码...
+            default:
+                response.setCode(ResponseCode.SYSTEM_ERROR);
+                break;
+        }
+    }
+    return response;
+}
+```
+
+**deletePrepareMessage：批量写入 op 记录（不是物理删除）**
+
+`deletePrepareMessage` 并非物理删除半消息，而是在 `RMQ_SYS_TRANS_OP_HALF_TOPIC` 写入一条标记消息（tag="d"，body=半消息的queueOffset）。后续事务回查服务通过检查 op topic 来判断哪些半消息已处理。
+
+```java
+// 源码路径: broker/src/main/java/org/apache/rocketmq/broker/transaction/queue/TransactionalMessageServiceImpl.java
+// 行 596-631
+public boolean deletePrepareMessage(MessageExt messageExt) {
+    Integer queueId = messageExt.getQueueId();
+    // 获取或创建该queueId对应的批量缓冲上下文
+    MessageQueueOpContext mqContext = deleteContext.get(queueId);
+    if (mqContext == null) {
+        mqContext = new MessageQueueOpContext(System.currentTimeMillis(), 20000);
+        MessageQueueOpContext old = deleteContext.putIfAbsent(queueId, mqContext);
+        if (old != null) { mqContext = old; }
+    }
+    
+    // 构建op数据：半消息的queueOffset + ","
+    String data = messageExt.getQueueOffset() + TransactionalMessageUtil.OFFSET_SEPARATOR;
+    try {
+        // 放入批量缓冲队列（容量20000）
+        boolean res = mqContext.getContextQueue().offer(data, 100, TimeUnit.MILLISECONDS);
+        if (res) {
+            int totalSize = mqContext.getTotalSize().addAndGet(data.length());
+            // 如果缓冲数据超过最大大小，立即触发批量发送
+            if (totalSize > transactionOpMsgMaxSize) {
+                this.transactionalOpBatchService.wakeup();
+            }
+            return true;
+        } else {
+            // 队列满，触发批量发送
+            this.transactionalOpBatchService.wakeup();
+        }
+    } catch (InterruptedException ignore) { }
+    
+    // fallback：同步写入单条op消息
+    Message msg = getOpMessage(queueId, data);
+    if (this.transactionalMessageBridge.writeOp(queueId, msg)) {
+        log.warn("Force add remove op data. queueId={}", queueId);
+        return true;
+    }
+    return false;
+}
+```
+
+**op 消息格式与批量发送机制：**
+
+```java
+// TransactionalMessageUtil.java 行 32-39
+public static final String REMOVE_TAG = "d";           // op消息tag
+public static final Charset CHARSET = StandardCharsets.UTF_8;
+public static final String OFFSET_SEPARATOR = ",";      // body中offset之间的分隔符
+public static String buildOpTopic() {
+    return TopicValidator.RMQ_SYS_TRANS_OP_HALF_TOPIC;  // op topic
+}
+
+// getOpMessage: 将多个offset合并为一条op消息
+public Message getOpMessage(int queueId, String moreData) {
+    StringBuilder sb = new StringBuilder();
+    if (moreData != null) { sb.append(moreData); }
+    // 从缓冲队列中取出所有待发送的offset
+    while (!mqContext.getContextQueue().isEmpty()) {
+        if (sb.length() >= maxSize) { break; }
+        String data = mqContext.getContextQueue().poll();
+        if (data != null) { sb.append(data); }
+    }
+    if (sb.length() == 0) { return null; }
+    // op消息: topic=RMQ_SYS_TRANS_OP_HALF_TOPIC, tag="d", body="offset1,offset2,offset3,"
+    return new Message(opTopic, TransactionalMessageUtil.REMOVE_TAG,
+            sb.toString().getBytes(TransactionalMessageUtil.CHARSET));
+}
+```
+
+`TransactionalOpBatchService` 是一个定时线程，每 `transactionOpBatchInterval` 毫秒（默认1000ms）或缓冲区满时触发一次批量发送，将积攒的 op offset 合并为少量消息写入 `RMQ_SYS_TRANS_OP_HALF_TOPIC`，与 half topic 的 queueId 一一对应。这种批量设计大幅减少了 op 消息的数量和 I/O 开销。
 
 #### 4.3.4 Broker 端：事务回查服务
 
@@ -9641,6 +11002,41 @@ private void sendMessageBackAsNormalMessage(MessageExt msg) {
 
 递增延时的设计既给了系统恢复的时间，又避免了频繁重试导致的雪崩。
 
+**★ 重试消息与延时消息的交叉关系：共享 SCHEDULE_TOPIC 基础设施**
+
+这是一个容易被忽略但至关重要的设计：重试消息本质上就是延时消息的一种特殊应用。当 `sendMessageBackAsNormalMessage` 构建重试消息时，设置了 `newMsg.setDelayTimeLevel(3 + msg.getReconsumeTimes())`，这使得重试消息在到达 Broker 后走与普通延时消息完全相同的路径。
+
+```
+重试消息的完整流转路径：
+
+1. Consumer 消费失败 → sendMessageBackAsNormalMessage
+2. 构建消息: topic=%RETRY%group, delayTimeLevel=3+reconsumeTimes
+3. 发送到 Broker → SendMessageProcessor
+4. ★ Broker 检测到 delayTimeLevel > 0，走延时消息路径:
+   - topic 改为 SCHEDULE_TOPIC_XXXX
+   - queueId = delayLevel - 1
+   - tagsCode = storeTime + delayMs
+   - 写入 CommitLog
+5. ★ ScheduleMessageService 的 DeliverDelayedMessageTimerTask 扫描到该消息
+   - 计算投递时间
+   - 到期后调用 messageTimeUp 恢复原始 topic (%RETRY%group)
+   - 重新写入 CommitLog
+6. Consumer 从 %RETRY%group 拉取并消费
+```
+
+关键交叉点在于步骤4-5：重试消息和用户主动发送的延时消息共用同一套 `SCHEDULE_TOPIC_XXXX` → `ScheduleMessageService` → `DeliverDelayedMessageTimerTask` → `messageTimeUp` 的基础设施。区别仅在于：
+
+延时消息的 `messageTimeUp` 恢复的是用户原始 Topic（如 `OrderTimeoutTopic`），而重试消息的 `messageTimeUp` 恢复的是 `%RETRY%group`。两者的 `PROPERTY_REAL_TOPIC` 不同，但走的是完全相同的代码路径。
+
+这意味着延时级别 `3 + reconsumeTimes` 必须在 `messageDelayLevel` 定义的18个级别范围内。默认配置 `"1s 5s 10s 30s 1m 2m 3m 4m 5m 6m 7m 8m 9m 10m 20m 30m 1h 2h"` 中：
+- level 3 = 10秒（第1次重试）
+- level 4 = 30秒（第2次重试）
+- level 5 = 1分钟（第3次重试）
+- ...
+- level 16 = 2小时（第14次重试，最后一次）
+
+如果 `reconsumeTimes` 超过13（即 delayLevel > 16），由于 maxDelayLevel=18，消息仍能被正确投递，但延时不再递增。
+
 #### 6.3.3 Broker 端：重试 vs 死信队列决策
 
 ```java
@@ -9841,7 +11237,7 @@ class AsyncDataSendTask {
         Map<String, List<TraceContext>> groupedContexts = ...;
         
         for (Map.Entry<String, List<TraceContext>> entry : groupedContexts.entrySet()) {
-            // 编码为字符串
+            // ★ 编码为轨迹数据字符串（见下方 encoderFromContextBean 详解）
             TraceTransferBean transferBean = TraceDataEncoder.encoderFromContextBean(context);
             StringBuilder data = new StringBuilder();
             data.append(transferBean.getTransData());
@@ -9873,6 +11269,140 @@ private DefaultMQProducer getAndCreateTraceProducer() {
 ```
 
 轨迹 Producer 自身关闭了轨迹功能，否则会形成无限递归（轨迹消息的发送轨迹又产生轨迹消息...）。
+
+**TraceDataEncoder.encoderFromContextBean 逐字段展开**
+
+`encoderFromContextBean` 是轨迹数据序列化的核心方法。它根据 `TraceType` 将 `TraceContext` 编码为特定格式的字符串，字段之间用 `TraceConstants.CONTENT_SPLITOR`（`\u0001`）分隔，记录之间用 `TraceConstants.FIELD_SPLITOR`（`\u0002`）终止。
+
+```java
+// 源码路径: client/src/main/java/org/apache/rocketmq/client/trace/TraceDataEncoder.java
+// 行 159-256
+public static TraceTransferBean encoderFromContextBean(TraceContext ctx) {
+    TraceTransferBean transferBean = new TraceTransferBean();
+    StringBuilder sb = new StringBuilder(256);
+    
+    switch (ctx.getTraceType()) {
+        case Pub:
+            // ★ Pub记录格式（14个字段）:
+            // TraceType | timeStamp | regionId | groupName | topic | msgId | tags | keys
+            // | storeHost | bodyLength | costTime | msgType.ordinal() | offsetMsgId | isSuccess
+            sb.append(ctx.getTraceType()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTimeStamp()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getRegionId()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getGroupName()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTopic()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getMsgId()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getTags()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getKeys()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getStoreHost()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getBodyLength()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getCostTime()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getMsgType().ordinal()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getOffsetMsgId()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.isSuccess()).append(TraceConstants.FIELD_SPLITOR);
+            break;
+            
+        case SubBefore:
+            // ★ SubBefore记录格式（每个TraceBean一条，8个字段）:
+            // TraceType | timeStamp | regionId | groupName | requestId | msgId | retryTimes | keys
+            for (TraceBean bean : ctx.getTraceBeans()) {
+                sb.append(ctx.getTraceType()).append(TraceConstants.CONTENT_SPLITOR)
+                  .append(ctx.getTimeStamp()).append(TraceConstants.CONTENT_SPLITOR)
+                  .append(ctx.getRegionId()).append(TraceConstants.CONTENT_SPLITOR)
+                  .append(ctx.getGroupName()).append(TraceConstants.CONTENT_SPLITOR)
+                  .append(ctx.getRequestId()).append(TraceConstants.CONTENT_SPLITOR)
+                  .append(bean.getMsgId()).append(TraceConstants.CONTENT_SPLITOR)
+                  .append((short) bean.getRetryTimes()).append(TraceConstants.CONTENT_SPLITOR)
+                  .append(bean.getKeys()).append(TraceConstants.FIELD_SPLITOR);
+            }
+            break;
+            
+        case SubAfter:
+            // ★ SubAfter记录格式（每个TraceBean一条，6+2个字段）:
+            // TraceType | requestId | msgId | costTime | isSuccess | keys | contextCode
+            // [ | timeStamp | groupName ]  ← 仅非CLOUD通道才有后两个字段
+            for (TraceBean bean : ctx.getTraceBeans()) {
+                sb.append(ctx.getTraceType()).append(TraceConstants.CONTENT_SPLITOR)
+                  .append(ctx.getRequestId()).append(TraceConstants.CONTENT_SPLITOR)
+                  .append(bean.getMsgId()).append(TraceConstants.CONTENT_SPLITOR)
+                  .append(ctx.getCostTime()).append(TraceConstants.CONTENT_SPLITOR)
+                  .append(ctx.isSuccess()).append(TraceConstants.CONTENT_SPLITOR)
+                  .append(bean.getKeys()).append(TraceConstants.CONTENT_SPLITOR)
+                  .append(ctx.getContextCode());
+                
+                if (ctx.getAccessChannel() != AccessChannel.CLOUD) {
+                    // 非CLOUD通道追加timeStamp和groupName
+                    sb.append(TraceConstants.CONTENT_SPLITOR)
+                      .append(ctx.getTimeStamp()).append(TraceConstants.CONTENT_SPLITOR)
+                      .append(ctx.getGroupName());
+                }
+                sb.append(TraceConstants.FIELD_SPLITOR);
+            }
+            break;
+            
+        case EndTransaction:
+            // ★ EndTransaction记录格式（13个字段）:
+            // TraceType | timeStamp | regionId | groupName | topic | msgId | tags | keys
+            // | storeHost | msgType.ordinal() | transactionId | transactionState.name() | isFromTransactionCheck
+            sb.append(ctx.getTraceType()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTimeStamp()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getRegionId()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getGroupName()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTopic()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getMsgId()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getTags()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getKeys()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getStoreHost()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getMsgType().ordinal()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getTransactionId()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getTransactionState().name()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).isFromTransactionCheck()).append(TraceConstants.FIELD_SPLITOR);
+            break;
+            
+        case Recall:
+            // ★ Recall记录格式（7个字段）:
+            // TraceType | timeStamp | regionId | groupName | topic | msgId | isSuccess
+            sb.append(ctx.getTraceType()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTimeStamp()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getRegionId()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getGroupName()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTopic()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.getTraceBeans().get(0).getMsgId()).append(TraceConstants.CONTENT_SPLITOR)
+              .append(ctx.isSuccess()).append(TraceConstants.FIELD_SPLITOR);
+            break;
+            
+        default:
+            break;
+    }
+    
+    transferBean.setTransData(sb.toString());
+    
+    // ★ 构建transKey：用于索引（msgId + 业务keys）
+    for (TraceBean bean : ctx.getTraceBeans()) {
+        transferBean.getTransKey().add(bean.getMsgId());
+        if (bean.getKeys() != null && bean.getKeys().length() > 0) {
+            String[] keys = bean.getKeys().split(MessageConst.KEY_SEPARATOR);
+            transferBean.getTransKey().addAll(Arrays.asList(keys));
+        }
+    }
+    
+    return transferBean;
+}
+```
+
+**五种轨迹类型的编码格式总结：**
+
+```
+类型            字段数   记录分隔                说明
+──────────────────────────────────────────────────────────────────────────
+Pub             14      FIELD_SPLITOR           消息发送轨迹，含costTime和offsetMsgId
+SubBefore       8       每个bean一条            消费前轨迹，含requestId和retryTimes
+SubAfter        6或8    每个bean一条            消费后轨迹，非CLOUD追加timeStamp+groupName
+EndTransaction  13      FIELD_SPLITOR           事务消息轨迹，含transactionState和isFromTransactionCheck
+Recall          7       FIELD_SPLITOR           消息撤回轨迹
+```
+
+`transKey` 集合包含原始消息的 `msgId` 和用户设置的 `keys`，用作轨迹消息的索引键，便于通过消息 ID 或业务 Key 反查轨迹。
 
 #### 7.3.3 三阶段轨迹采集
 
