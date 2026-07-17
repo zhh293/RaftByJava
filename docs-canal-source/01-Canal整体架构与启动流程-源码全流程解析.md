@@ -2179,3 +2179,1490 @@ public void start() {
 ```
 
 > **这一步在干什么？** 单机模式的启动路径非常简洁——没有 ZK 注册、没有 HA 竞争、没有 running 节点创建。`processActiveEnter()` 直接触发 `embeddedCanalServer.start("example")`，Instance 立刻开始连接 MySQL、dump binlog。
+
+
+**Step 4：CanalServerWithNetty.start() —— Netty Pipeline 建立 TCP 监听**
+
+```java
+// CanalServerWithNetty.start()
+public void start() {
+    this.bootstrap = new ServerBootstrap(
+        new NioServerSocketChannelFactory(
+            Executors.newCachedThreadPool(),
+            Executors.newCachedThreadPool()));
+
+    bootstrap.setPipelineFactory(() -> {
+        ChannelPipeline pipeline = Channels.pipeline();
+        pipeline.addLast(FixedHeaderFrameDecoder.class.getName(),
+            new FixedHeaderFrameDecoder());           // 4 字节长度帧解码
+        pipeline.addLast(HandshakeInitializationHandler.class.getName(),
+            new HandshakeInitializationHandler(childGroups));  // 握手
+        pipeline.addLast(ClientAuthenticationHandler.class.getName(),
+            new ClientAuthenticationHandler(embeddedServer));  // 认证
+        pipeline.addLast(SessionHandler.class.getName(),
+            new SessionHandler(embeddedServer));       // 业务处理
+        return pipeline;
+    });
+
+    // 绑定 11111 端口
+    this.serverChannel = bootstrap.bind(new InetSocketAddress(this.ip, this.port));
+}
+```
+
+> **这一步在干什么？** Netty 3.x 的 Pipeline 由 4 个 Handler 组成。客户端 TCP 连接建立后，会依次经过握手（发送随机 seed）、认证（校验密码）、会话处理（dispatch subscribe/get/ack 请求）。这是 TCP 模式独有的网络层——Kafka 模式下 Netty 不会启动。
+
+**Step 5：SimpleCanalConnector.connect() —— 客户端建连**
+
+```java
+// SimpleCanalConnector.doConnect()
+private void doConnect() throws CanalClientException {
+    // 1. 建立 TCP 连接
+    this.channel = SocketChannel.open();
+    this.channel.connect(this.address);  // TCP 三次握手
+
+    // 2. 接收 HANDSHAKE 包（含随机 seed）
+    Packet packet = Packet.parseFrom(readNextPacket());
+    // packet.type == HANDSHAKE
+    Handshake handshake = Handshake.parseFrom(packet.getBody());
+    byte[] seed = handshake.getSeeds().toByteArray();  // 服务端生成的随机种子
+
+    // 3. 用 seed 加密密码，发送 CLIENTAUTHENTICATION
+    ByteString scrambled = ByteString.copyFrom(
+        SecurityUtil.scramble411(passwd.getBytes(), seed));
+    ClientAuth clientAuth = ClientAuth.newBuilder()
+        .setUsername(user)
+        .setPassword(scrambled)
+        .setNetReadTimeout(idleTimeout)
+        .setNetWriteTimeout(idleTimeout)
+        .build();
+    writeWithHeader(Packet.newBuilder()
+        .setType(PacketType.CLIENTAUTHENTICATION)
+        .setBody(clientAuth.toByteString())
+        .build().toByteArray());
+
+    // 4. 接收 ACK
+    Packet ackPacket = Packet.parseFrom(readNextPacket());
+    Ack ack = Ack.parseFrom(ackPacket.getBody());
+    if (ack.getErrorCode() > 0) {
+        throw new CanalClientException("auth failed: " + ack.getErrorMessage());
+    }
+    // 连接成功！
+    this.connected = true;
+}
+```
+
+> **这一步在干什么？** 客户端的连接过程完全模拟了 MySQL 的握手认证协议——服务端先发 seed，客户端用 seed 对密码做 SHA1 加扰（scramble411 算法），服务端比对。密码不会以明文在网络上传输。整个过程使用 Protobuf 编解码，帧格式是"4 字节长度 + body"。
+
+**Step 6：SimpleCanalConnector.subscribe() —— 订阅 destination**
+
+```java
+public void subscribe(String filter) throws CanalClientException {
+    Sub sub = Sub.newBuilder()
+        .setDestination(this.destination)  // "example"
+        .setClientId(String.valueOf(this.clientId))  // 默认 1001
+        .setFilter(filter != null ? filter : "")  // "mydb\\..*"
+        .build();
+
+    writeWithHeader(Packet.newBuilder()
+        .setType(PacketType.SUBSCRIPTION)
+        .setBody(sub.toByteString())
+        .build().toByteArray());
+
+    // 等待 ACK
+    Packet packet = Packet.parseFrom(readNextPacket());
+    Ack ack = Ack.parseFrom(packet.getBody());
+    // 订阅成功
+}
+```
+
+服务端 `SessionHandler` 收到 SUBSCRIPTION 包后调用 `embeddedServer.subscribe(clientIdentity)`，服务端处理：
+
+```java
+// CanalServerWithEmbedded.subscribe()
+public void subscribe(ClientIdentity clientIdentity) {
+    CanalInstance canalInstance = canalInstances.get(clientIdentity.getDestination());
+    // "example" → 找到对应的 Instance
+
+    canalInstance.getMetaManager().subscribe(clientIdentity);
+    // 存储客户端信息到 MetaManager（文件或 ZK）
+
+    // 如果客户端带了 filter，动态替换 Parser 的过滤规则
+    if (StringUtils.isNotEmpty(clientIdentity.getFilter())) {
+        canalInstance.subscribeChange(clientIdentity);
+        // → 更新 eventParser 的 eventFilter
+    }
+}
+```
+
+> **这一步在干什么？** 客户端订阅触发了两件事：1）MetaManager 记录这个客户端的信息（clientId、filter），后续 ack/rollback 都基于这个客户端标识。2）如果客户端的 filter 和 Instance 初始配置不同，**动态替换** Parser 的过滤规则——这意味着客户端可以在运行时缩小或扩大监听范围。
+
+**Step 7：SimpleCanalConnector.getWithoutAck() —— 拉取变更数据**
+
+```java
+// 客户端
+public Message getWithoutAck(int batchSize) throws CanalClientException {
+    Get get = Get.newBuilder()
+        .setDestination(destination)
+        .setClientId(String.valueOf(clientId))
+        .setFetchSize(batchSize)  // 100
+        .setAutoAck(false)
+        .setTimeout(-1)  // 无超时
+        .setUnit(-1)
+        .build();
+
+    writeWithHeader(Packet.newBuilder()
+        .setType(PacketType.GET)
+        .setBody(get.toByteString())
+        .build().toByteArray());
+
+    // 接收 MESSAGES 响应
+    Packet packet = Packet.parseFrom(readNextPacket());
+    return CanalMessageDeserializer.deserializer(packet.getBody());
+}
+```
+
+服务端处理链路：
+
+```java
+// CanalServerWithEmbedded.getWithoutAck()
+public Message getWithoutAck(ClientIdentity clientIdentity, int batchSize, ...) {
+    CanalInstance instance = canalInstances.get(clientIdentity.getDestination());
+
+    // 1. 获取当前消费位点
+    Position start = instance.getMetaManager().getCursor(clientIdentity);
+
+    // 2. 从 RingBuffer 中读取数据
+    Events<Event> events = instance.getEventStore().get(start, batchSize, timeout, unit);
+    // → MemoryEventStoreWithBuffer.get()
+    //   从 RingBuffer 中按 getSequence 读取 batchSize 条数据
+    //   推进 getSequence
+
+    // 3. 记录 batch（不 ack，等客户端确认）
+    Long batchId = instance.getMetaManager().addBatch(
+        clientIdentity, events.getPositionRange());
+
+    // 4. 组装 Message 返回
+    Message message = new Message(batchId, events.getEvents());
+    return message;
+}
+```
+
+> **这一步在干什么？** 这是数据消费的核心路径。客户端发送 GET 请求 → 服务端从 MemoryEventStoreWithBuffer 的 RingBuffer 中读取数据 → MetaManager 记录 batch 信息（batchId → positionRange 映射）→ 返回给客户端。`getWithoutAck` 意味着读完不自动推进 cursor，必须客户端显式 ack。
+
+**Step 8：SimpleCanalConnector.ack() —— 确认消费**
+
+```java
+// 客户端
+public void ack(long batchId) throws CanalClientException {
+    ClientAck clientAck = ClientAck.newBuilder()
+        .setDestination(destination)
+        .setClientId(String.valueOf(clientId))
+        .setBatchId(batchId)
+        .build();
+
+    writeWithHeader(Packet.newBuilder()
+        .setType(PacketType.CLIENTACK)
+        .setBody(clientAck.toByteString())
+        .build().toByteArray());
+}
+```
+
+服务端：
+
+```java
+// CanalServerWithEmbedded.ack()
+public void ack(ClientIdentity clientIdentity, long batchId) {
+    CanalInstance instance = canalInstances.get(clientIdentity.getDestination());
+
+    // 1. 从 MetaManager 移除 batch 记录，获取 positionRange
+    PositionRange<LogPosition> positionRange =
+        instance.getMetaManager().removeBatch(clientIdentity, batchId);
+
+    // 2. 推进 EventStore 的 ackSequence
+    instance.getEventStore().ack(positionRange.getEnd());
+    // → MemoryEventStoreWithBuffer.ack()
+    //   ackSequence 前移，RingBuffer 腾出空间给 Parser 写入新数据
+
+    // 3. 更新 MetaManager 的消费游标（cursor）
+    instance.getMetaManager().updateCursor(clientIdentity, positionRange.getEnd());
+    // → FileMixedMetaManager：内存更新 + 周期刷盘
+}
+```
+
+> **这一步在干什么？** ack 触发三个关键动作：1）从 MetaManager 清除 batch 记录（该 batch 不会再被 rollback）。2）推进 Store 的 ackSequence——这是 RingBuffer 的"回收"指针，ack 之后该区间的 buffer slot 可以被 Parser 重用。3）更新消费游标到 batch 的末尾位置，下次 get 从这个位置继续。
+
+**TCP 单机模式 —— 完整数据流图**
+
+```
+  Java Client (JVM)                    Canal Server (JVM)                     MySQL
+       |                                     |                                  |
+   connect() ----TCP三次握手-------------→ accept()                              |
+       |←------HANDSHAKE(seed)------------ HandshakeHandler                    |
+   scramble411() ----CLIENTAUTH----------→ ClientAuthHandler                    |
+       |←------ACK(success)-------------- (Pipeline 重构)                      |
+       |                                     |                                  |
+   subscribe("mydb\\..*") --SUBSCRIPTION--→ embeddedServer.subscribe()          |
+       |                                  → MetaManager.subscribe()             |
+       |                                  → eventParser.setFilter()             |
+       |←------ACK(success)-------------- (动态更新过滤规则)                    |
+       |                                     |                                  |
+       |                              Instance.start()                          |
+       |                              → MysqlEventParser.start()                |
+       |                                → MysqlConnection.connect()  --------→ MySQL
+       |                                → COM_REGISTER_SLAVE        --------→  |
+       |                                → COM_BINLOG_DUMP           --------→  |
+       |                                ←--- binlog event stream ----------- dump
+       |                                → LogDecoder.decode()                   |
+       |                                → LogEventConvert.parse()               |
+       |                                → AviaterRegexFilter.filter()           |
+       |                                → EventTransactionBuffer.add()          |
+       |                                → EventStore.put()  (RingBuffer)        |
+       |                                     |                                  |
+   getWithoutAck(100) ----GET------------→ eventStore.get()                     |
+       |                                  → MetaManager.addBatch()              |
+       |←------MESSAGES(batch)----------- (batchId + entries)                  |
+       |                                     |                                  |
+   处理业务逻辑（刷新缓存等）               |                                  |
+       |                                     |                                  |
+   ack(batchId) ----CLIENTACK------------→ eventStore.ack()                     |
+       |                                  → MetaManager.updateCursor()          |
+       |                                  → MetaManager.removeBatch()           |
+       |                                     |                                  |
+   (循环继续...)                            |                                  |
+```
+
+---
+
+## 案例二：Kafka MQ 模式 —— 变更数据自动推送到 Kafka
+
+### 场景描述
+
+电商平台的订单系统使用 MySQL 存储订单数据。需要把订单表的变更实时推送到 Kafka，供下游多个消费系统（搜索引擎、数据分析、风控）各自消费。不需要写 Java 客户端——Canal 自己就是"内置的消费者+生产者"。
+
+### 配置
+
+```properties
+# canal.properties
+canal.serverMode = kafka
+canal.destinations = order_sync
+canal.mq.servers = kafka-broker1:9092,kafka-broker2:9092
+canal.mq.flatMessage = true
+canal.mq.compressionType = lz4
+canal.mq.acks = all
+
+# conf/order_sync/instance.properties
+canal.instance.master.address = 10.0.1.100:3306
+canal.instance.dbUsername = canal
+canal.instance.dbPassword = canal
+canal.instance.filter.regex = orderdb\\.orders,orderdb\\.order_items
+canal.mq.topic = canal_orders
+canal.mq.dynamicTopic = orderdb\\.orders:topic_orders,orderdb\\.order_items:topic_order_items
+canal.mq.partitionsNum = 8
+canal.mq.partitionHash = orderdb\\.orders:order_id,orderdb\\.order_items:order_id
+```
+
+### 全链路源码追踪
+
+**Step 1：CanalStarter —— SPI 加载 CanalKafkaProducer**
+
+```java
+// CanalStarter.start()
+String serverMode = CanalController.getProperty(properties, CanalConstants.CANAL_SERVER_MODE);
+// serverMode = "kafka"，不等于 "tcp"
+
+if (!"tcp".equalsIgnoreCase(serverMode)) {
+    // 走这里！通过 SPI 加载 Kafka Producer
+    ExtensionLoader<CanalMQProducer> loader =
+        ExtensionLoader.getExtensionLoader(CanalMQProducer.class);
+    canalMQProducer = new ProxyCanalMQProducer(
+        loader.getExtension(serverMode.toLowerCase(),  // "kafka"
+            CONNECTOR_SPI_DIR,        // "META-INF/canal/"
+            CONNECTOR_STANDBY_SPI_DIR // "META-INF/canal/standby/"
+        )
+    );
+}
+```
+
+> **这一步在干什么？** `serverMode=kafka` 触发 SPI 加载。Canal 在 `META-INF/canal/com.alibaba.otter.canal.connector.core.spi.CanalMQProducer` 中注册了 `kafka=com.alibaba.otter.canal.connector.kafka.producer.CanalKafkaProducer`。`ProxyCanalMQProducer` 包装了一层 ClassLoader 隔离——因为 Kafka client JAR 是在 `plugin/` 目录下独立加载的，不与 Canal 核心的 ClassLoader 混用。
+
+**Step 2：CanalKafkaProducer.init() —— 初始化 Kafka Producer**
+
+```java
+// CanalKafkaProducer.init()
+public void init(Properties properties) {
+    KafkaProducerConfig kafkaConfig = new KafkaProducerConfig();
+
+    Properties kafkaProps = new Properties();
+    kafkaProps.put("bootstrap.servers", kafkaConfig.getServers());
+    kafkaProps.put("acks", kafkaConfig.getAcks());
+    kafkaProps.put("compression.type", kafkaConfig.getCompressionType());
+    kafkaProps.put("batch.size", kafkaConfig.getBatchSize());
+    kafkaProps.put("linger.ms", kafkaConfig.getLingerMs());
+    kafkaProps.put("max.request.size", kafkaConfig.getMaxRequestSize());
+    kafkaProps.put("buffer.memory", kafkaConfig.getBufferMemory());
+    // 关键：保证分区内有序
+    kafkaProps.put("max.in.flight.requests.per.connection", 1);
+
+    kafkaProps.put("key.serializer", StringSerializer.class.getName());
+    kafkaProps.put("value.serializer", ByteArraySerializer.class.getName());
+
+    producer = new KafkaProducer<>(kafkaProps);
+}
+```
+
+> **这一步在干什么？** 创建 Kafka 原生 Producer。注意 `max.in.flight.requests.per.connection=1` 这个硬编码——这是为了保证同一分区内消息的严格有序性（如果允许多个 in-flight 请求，网络重传可能导致乱序）。
+
+**Step 3：CanalController 构造 —— 禁用 Netty**
+
+```java
+// CanalStarter.start() 中，MQ 模式设置 withoutNetty
+if (canalMQProducer != null) {
+    System.setProperty(CanalConstants.CANAL_WITHOUT_NETTY, "true");
+}
+```
+
+```java
+// CanalController 构造函数
+String canalWithoutNetty = getProperty(properties, CanalConstants.CANAL_WITHOUT_NETTY);
+// canalWithoutNetty = "true"
+if (canalWithoutNetty == null || "false".equals(canalWithoutNetty)) {
+    // Kafka 模式不走这里！CanalServerWithNetty 不会被创建
+    canalServer = CanalServerWithNetty.instance();
+}
+// canalServer 保持 null
+```
+
+> **这一步在干什么？** Kafka 模式不需要 TCP 端口（没有外部客户端来连接），所以 Netty 被禁用。11111 端口不会被监听。数据消费由内部的 CanalMQStarter 完成。
+
+**Step 4：CanalMQStarter.start() —— 为每个 destination 创建 Worker 线程**
+
+```java
+// CanalStarter.start() 中
+canalMQStarter = new CanalMQStarter(canalMQProducer);
+controller.start();
+String destinations = CanalController.getProperty(properties, CanalConstants.CANAL_DESTINATIONS);
+canalMQStarter.start(destinations);  // "order_sync"
+```
+
+```java
+// CanalMQStarter.start()
+public synchronized void start(String destinations) {
+    String[] dests = StringUtils.split(destinations, ",");
+    for (String destination : dests) {
+        startDestination(destination.trim());  // "order_sync"
+    }
+}
+
+public synchronized void startDestination(String destination) {
+    CanalMQRunnable canalMQRunnable = new CanalMQRunnable(destination);
+    canalMQWorks.put(destination, canalMQRunnable);
+    executorService.execute(canalMQRunnable);
+    // 启动一个独立线程，不断从 embeddedServer 拉数据、发到 Kafka
+}
+```
+
+> **这一步在干什么？** CanalMQStarter 为每个 destination 创建一个 Worker 线程。这个线程扮演了"内置客户端"的角色——它使用 `clientId=1001` 订阅 CanalServerWithEmbedded，不断拉取数据，然后通过 CanalKafkaProducer 发送到 Kafka。
+
+**Step 5：CanalMQRunnable.run() —— 消费循环**
+
+```java
+// CanalMQRunnable.run() 核心循环
+while (running) {
+    canalServer.subscribe(clientIdentity);
+
+    while (running) {
+        Message message = canalServer.getWithoutAck(clientIdentity, batchSize);
+
+        if (message == null || message.getId() == -1L) {
+            Thread.sleep(100);  // 无数据时休眠 100ms
+            continue;
+        }
+
+        MQDestination mqDestination = new MQDestination();
+        mqDestination.setTopic(mqConfig.getTopic());             // "canal_orders"
+        mqDestination.setDynamicTopic(mqConfig.getDynamicTopic());
+        mqDestination.setPartitionsNum(mqConfig.getPartitionsNum()); // 8
+        mqDestination.setPartitionHash(mqConfig.getPartitionHash());
+
+        canalMQProducer.send(mqDestination, message, new Callback() {
+            public void commit() {
+                canalServer.ack(clientIdentity, message.getId());
+            }
+            public void rollback() {
+                canalServer.rollback(clientIdentity, message.getId());
+            }
+        });
+    }
+}
+```
+
+> **这一步在干什么？** Worker 线程执行一个无限循环：从 Store 拉取 → 发到 Kafka → 异步回调 ack/rollback。Kafka 的 `producer.send()` 是异步的，只有当 Kafka broker 确认收到后才调用 commit()（ack），如果发送失败则调用 rollback()——数据会被重新拉取。
+
+**Step 6：CanalKafkaProducer.send() —— 动态 Topic + 分区哈希**
+
+```java
+// CanalKafkaProducer.send()
+public void send(MQDestination destination, Message message, Callback callback) {
+    if (StringUtils.isNotEmpty(destination.getDynamicTopic())) {
+        // 动态 topic 模式：按表名路由到不同 topic
+        Map<String, Message> topicMessages =
+            MQMessageUtils.messageTopics(message, destination.getTopic(),
+                destination.getDynamicTopic());
+        // topicMessages = {
+        //   "topic_orders": [orders 表的变更],
+        //   "topic_order_items": [order_items 表的变更]
+        // }
+
+        ExecutorTemplate template = new ExecutorTemplate(sendExecutor);
+        for (Map.Entry<String, Message> entry : topicMessages.entrySet()) {
+            final String topicName = entry.getKey().replace(".", "_");
+            final Message topicMsg = entry.getValue();
+            template.submit(() -> {
+                sendMessage(topicName, topicMsg, destination);
+            });
+        }
+        template.waitForResult();  // 等待所有 topic 发送完成
+    } else {
+        sendMessage(destination.getTopic(), message, destination);
+    }
+
+    callback.commit();  // 全部发送成功，ack
+}
+```
+
+```java
+// sendMessage() —— 分区路由
+private void sendMessage(String topic, Message message, MQDestination destination) {
+    if (destination.getPartitionHash() != null
+        && !destination.getPartitionHash().isEmpty()) {
+        // 哈希分区模式：按 PK 字段值哈希
+        Message[] partitionMessages = MQMessageUtils.messagePartition(
+            message, destination.getPartitionsNum(),  // 8
+            destination.getPartitionHash(),
+            mqProperties.isDatabaseHash());
+        // partitionMessages[0..7]：8 个分区对应的消息
+
+        for (int i = 0; i < partitionMessages.length; i++) {
+            Message partMsg = partitionMessages[i];
+            if (partMsg != null) {
+                byte[] body = flatMessage ?
+                    JSON.toJSONBytes(FlatMessage.messageConverter(partMsg)) :
+                    CanalMessageSerializerUtil.serializer(partMsg);
+                ProducerRecord<String, byte[]> record =
+                    new ProducerRecord<>(topic, i, null, body);
+                Future<RecordMetadata> future = producer.send(record);
+                futures.add(future);
+            }
+        }
+        producer.flush();
+        for (Future<RecordMetadata> future : futures) {
+            future.get();  // 阻塞等待 Kafka 确认
+        }
+    }
+}
+```
+
+> **这一步在干什么？** 这是 Kafka 模式最核心的逻辑，包含两层路由：第一层是**动态 Topic 路由**，按表名将不同表的变更路由到不同的 Kafka Topic。第二层是**分区哈希路由**，按指定字段（order_id）的值做哈希取模，保证同一个 order_id 的所有变更始终落到同一个 Kafka 分区，下游消费者只需要保证"同分区内顺序消费"即可保证同一订单的变更顺序。
+
+**Kafka 模式 —— 完整数据流图**
+
+```
+  MySQL                    Canal Server                              Kafka
+    |                          |                                       |
+    |--binlog events-------→ MysqlEventParser                         |
+    |                        → LogDecoder                              |
+    |                        → LogEventConvert                         |
+    |                        → AviaterRegexFilter                      |
+    |                          (只保留 orders + order_items)            |
+    |                        → EventStore (RingBuffer)                 |
+    |                          |                                       |
+    |                        CanalMQStarter (Worker 线程)               |
+    |                        → getWithoutAck(batchSize)                |
+    |                          |                                       |
+    |                        CanalKafkaProducer.send()                 |
+    |                        → messageTopics()                         |
+    |                          |  orders → topic_orders               |
+    |                          |  order_items → topic_order_items      |
+    |                        → messagePartition()                      |
+    |                          |  hash(order_id) % 8 → partition      |
+    |                        → producer.send(ProducerRecord) --------→ |
+    |                        → producer.flush()                  ack   |
+    |                        ← future.get() (等待确认)  ←-----------   |
+    |                        → callback.commit()                       |
+    |                        → canalServer.ack()                       |
+    |                        → eventStore.ack() (回收 RingBuffer)      |
+```
+
+---
+
+## 案例三：ZooKeeper HA 双机热备 —— 故障自动转移
+
+### 场景描述
+
+核心交易数据库的 Canal 同步必须 7x24 高可用。部署两台 Canal Server 配置相同的 destination，通过 ZooKeeper 实现主备竞争。Active 宕机后 Standby 秒级接管。
+
+### 配置
+
+```properties
+# 两台 Server 的 canal.properties 完全相同（除了 canal.id）
+# Server A: canal.id = 1
+# Server B: canal.id = 2
+canal.zkServers = zk1:2181,zk2:2181,zk3:2181
+canal.serverMode = tcp
+canal.destinations = trade_sync
+canal.instance.global.spring.xml = classpath:spring/default-instance.xml
+```
+
+### 全链路源码追踪
+
+**Step 1：CanalController 构造 —— 初始化 ZooKeeper 客户端**
+
+```java
+String zkServers = getProperty(properties, CanalConstants.CANAL_ZKSERVERS);
+// zkServers = "zk1:2181,zk2:2181,zk3:2181"（非空）
+
+if (StringUtils.isNotEmpty(zkServers)) {
+    // HA 模式走这里！
+    this.zkClientx = ZkClientx.getZkClient(zkServers);
+}
+```
+
+**Step 2：配置 ServerRunningMonitor 的 4 个回调**
+
+```java
+ServerRunningData serverData = new ServerRunningData(
+    cid, ip + ":" + port);  // "10.0.1.1:11111"
+
+ServerRunningMonitors.setRunningMonitors(
+    MigrateMap.makeComputingMap(destination -> {
+        ServerRunningMonitor monitor = new ServerRunningMonitor(serverData);
+        monitor.setDestination(destination);
+        monitor.setListener(new ServerRunningListener() {
+            public void processActiveEnter() {
+                // 抢到运行权 → 启动 Instance
+                embeddedCanalServer.start(destination);
+            }
+            public void processActiveExit() {
+                // 失去运行权 → 停止 Instance
+                embeddedCanalServer.stop(destination);
+            }
+            public void processStart() {
+                // 注册 ZK 集群节点
+                if (zkClientx != null) {
+                    String path = ZookeeperPathUtils
+                        .getDestinationClusterNode(destination, ip + ":" + port);
+                    zkClientx.createEphemeral(path);
+                }
+            }
+            public void processStop() {
+                // 注销 ZK 集群节点
+                if (zkClientx != null) {
+                    String path = ZookeeperPathUtils
+                        .getDestinationClusterNode(destination, ip + ":" + port);
+                    zkClientx.delete(path);
+                }
+            }
+        });
+        monitor.setZkClient(zkClientx);
+        return monitor;
+    })
+);
+```
+
+**Step 3：Server A（先启动）抢占成功**
+
+```java
+// ServerRunningMonitor.initRunning()
+private void initRunning() {
+    String path = "/otter/canal/destinations/trade_sync/running";
+    try {
+        zkClient.createEphemeral(path, JsonUtils.marshalToByte(serverData));
+        // 创建成功！
+        activeData = serverData;
+        processActiveEnter();
+        // → embeddedCanalServer.start("trade_sync")
+        mutex.set(true);
+    } catch (ZkNodeExistsException e) {
+        // 不会到这里（Server A 是第一个）
+    }
+}
+```
+
+**Server B（后启动）进入 Standby**
+
+```java
+private void initRunning() {
+    try {
+        zkClient.createEphemeral(path, bytes);
+        // 创建失败！节点已被 Server A 占用
+    } catch (ZkNodeExistsException e) {
+        byte[] data = zkClient.readData(path, true);
+        ServerRunningData activeNodeData = JsonUtils.unmarshalFromByte(data, ...);
+        // activeNodeData = {"cid":1, "address":"10.0.1.1:11111"}
+
+        if (activeNodeData.getAddress().equals(serverData.getAddress())) {
+            // 不走这里（不是自己的残留节点）
+        } else {
+            activeData = activeNodeData;
+            // Server B 进入 Standby，通过 dataListener 监听节点变化
+        }
+    }
+}
+```
+
+**Step 4：Server A 宕机 → Server B 接管**
+
+```java
+// Server B 的 dataListener 被触发
+public void handleDataDeleted(String dataPath) throws Exception {
+    mutex.set(false);
+    // 延迟 5 秒后重新抢占（避免网络抖动误判）
+    delayExec.schedule(() -> {
+        initRunning();
+    }, delayTime, TimeUnit.SECONDS);
+}
+
+// 5 秒后...
+private void initRunning() {
+    try {
+        zkClient.createEphemeral(path, bytes);
+        // 创建成功！Server B 抢到运行权
+        activeData = serverData;
+        processActiveEnter();
+        // → embeddedCanalServer.start("trade_sync")
+        // → 从 ZK 恢复消费位点
+        // → 从断点继续消费
+        mutex.set(true);
+    } catch (ZkNodeExistsException e) { ... }
+}
+```
+
+> **关键时间线**：Server A 宕机 → ZK session 超时（~30秒）→ 临时节点删除 → Server B 收到通知 → 延迟 5 秒 → 抢占成功 → 恢复消费。总故障转移时间约 35 秒。HA 模式必须用 `default-instance.xml`（ZooKeeperMetaManager），否则 Server B 无法读取 Server A 的消费位点。
+
+---
+
+## 案例四：GTID 模式 —— 跨 MySQL 主从切换不丢数据
+
+### 场景描述
+
+MySQL 使用 GTID 模式，业务需要在 MySQL 主从切换时 Canal 自动跟随新主库继续消费。
+
+### 配置
+
+```properties
+canal.instance.gtidon = true
+canal.instance.master.gtid = 3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5
+```
+
+### 全链路源码追踪
+
+**Step 1：findStartPosition() —— GTID 分支**
+
+```java
+// MysqlEventParser.findStartPosition()
+if (isGTIDMode()) {
+    // 1. 检查持久化的 GTID 位点
+    LogPosition logPosition = logPositionManager.getLatestIndexBy(destination);
+    if (logPosition != null && StringUtils.isNotEmpty(logPosition.getPostion().getGtid())) {
+        return logPosition.getPostion();
+        // 从持久化的 GTID 恢复
+    }
+    // 2. 使用初始配置 GTID
+    if (masterPosition != null && StringUtils.isNotEmpty(masterPosition.getGtid())) {
+        return masterPosition;
+    }
+}
+// 非 GTID 模式走 file+position
+return findStartPositionInternal(connection);
+```
+
+**Step 2：COM_BINLOG_DUMP_GTID 命令**
+
+```java
+// MysqlConnection.dump(String gtid, SinkFunction func)
+public void dump(String gtid, SinkFunction func) throws IOException {
+    GTIDSet gtidSet = MysqlGTIDSet.parse(gtid);
+    // "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5"
+
+    BinlogDumpGTIDCommandPacket command = new BinlogDumpGTIDCommandPacket();
+    command.setSlaveServerId(slaveId);
+    command.setGtidSet(gtidSet);
+    // 命令字节：0x1e (COM_BINLOG_DUMP_GTID)
+    // flags = 0x04 (BINLOG_THROUGH_GTID)
+
+    connector.getChannel().writeCache(command.toBytes());
+
+    LogContext context = new LogContext();
+    context.setGtidSet(gtidSet);
+    // 后续 GtidLogEvent 会调用 gtidSet.update() 累加
+}
+```
+
+**Step 3：GTID 累加与位点持久化**
+
+```java
+// LogDecoder.decode() 中
+case LogEvent.GTID_LOG_EVENT:
+    GtidLogEvent gtidEvent = new GtidLogEvent(header, buffer, descriptionEvent);
+    String gtidStr = gtidEvent.getGtidStr();
+    // "3E11FA47-71CA-11E1-9E33-C80AA9429562:1001"
+    context.getGtidSet().update(gtidStr);
+    // gtidSet → "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-1001"
+    header.putGtid(gtidStr);
+    break;
+```
+
+```java
+// AbstractEventParser.buildLastPosition()
+position.setGtid(entry.getHeader().getGtid());
+// 持久化到 ZK/文件时包含 GTID 信息
+```
+
+> **GTID vs file+position 关键差异**：GTID 模式用 `COM_BINLOG_DUMP_GTID`（0x1e）代替 `COM_BINLOG_DUMP`（0x12），不需要指定 binlog 文件名和偏移量。MySQL 主从切换后 binlog 文件名可能完全不同，但 GTID 是全局唯一的，在新主库上也能正确定位。
+
+---
+
+## 案例五：多 Destination 同时运行
+
+### 场景描述
+
+一台 Canal Server 同时监控 3 个不同的 MySQL 实例。
+
+### 配置
+
+```properties
+canal.destinations = user_sync,order_sync,product_sync
+```
+
+### 全链路源码追踪
+
+```java
+// CanalController.initInstanceConfig()
+String[] destinations = StringUtils.split(destinationStr, ",");
+for (String destination : destinations) {
+    InstanceConfig config = parseInstanceConfig(properties, destination.trim());
+    instanceConfigs.put(destination.trim(), config);
+}
+// instanceConfigs = {"user_sync": ..., "order_sync": ..., "product_sync": ...}
+
+// CanalController.start() → 逐个启动
+for (Map.Entry<String, InstanceConfig> entry : instanceConfigs.entrySet()) {
+    String destination = entry.getKey();
+    ServerRunningMonitor monitor =
+        ServerRunningMonitors.getRunningMonitor(destination);
+    if (!config.getLazy() && !monitor.isStart()) {
+        monitor.start();
+        // Monitor("user_sync").start()    → 连接 mysql-user:3306
+        // Monitor("order_sync").start()   → 连接 mysql-order:3306
+        // Monitor("product_sync").start() → 连接 mysql-product:3306
+    }
+}
+```
+
+> **关键设计**：每个 destination 有完全独立的组件集——独立的 Spring ApplicationContext、独立的 MySQL 连接、独立的 dump 线程、独立的 RingBuffer、独立的 MetaManager。它们之间互不干扰。客户端请求通过 destination 字段路由到对应的 Instance。
+
+---
+
+## 案例六：表过滤 —— 黑白名单正则匹配
+
+### 场景描述
+
+数据库有上百张表，只需要同步 `order_*` 表，排除 `order_log` 和 `order_archive`。
+
+### 配置
+
+```properties
+canal.instance.filter.regex = orderdb\\.order_.*
+canal.instance.filter.black.regex = orderdb\\.order_log,orderdb\\.order_archive
+```
+
+### 全链路源码追踪
+
+**Step 1：AviaterRegexFilter 构造**
+
+```java
+// AviaterRegexFilter 构造
+public AviaterRegexFilter(String pattern, boolean defaultEmptyValue) {
+    // 白名单 defaultEmptyValue = true
+    // 黑名单 defaultEmptyValue = false
+
+    List<String> list = split(pattern, ",");
+    // 按长度降序排列（解决前缀匹配问题）
+    list.sort((a, b) -> b.length() - a.length());
+
+    StringBuilder sb = new StringBuilder();
+    for (String item : list) {
+        sb.append("^").append(item).append("$").append("|");
+    }
+    this.pattern = sb.substring(0, sb.length() - 1);
+    // 白名单: "^orderdb\\.order_.*$"
+    // 黑名单: "^orderdb\\.order_log$|^orderdb\\.order_archive$"
+
+    this.exp = AviatorEvaluator.compile("regex(pattern, target)", true);
+    // regex() 函数内部使用 Jakarta ORO 的 Perl5 正则引擎
+}
+```
+
+**Step 2：LogEventConvert 中过滤**
+
+```java
+// LogEventConvert.parseRowsEvent()
+String fullName = schemaName + "." + tableName;  // "orderdb.order_items"
+
+// 白名单过滤
+if (nameFilter != null && !nameFilter.filter(fullName)) {
+    return null;  // 不匹配白名单，丢弃
+}
+// 黑名单过滤
+if (nameBlackFilter != null && nameBlackFilter.filter(fullName)) {
+    return null;  // 匹配黑名单，丢弃
+}
+// 通过过滤，继续解析...
+```
+
+| 表名 | 白名单 | 黑名单 | 结果 |
+|------|--------|--------|------|
+| `orderdb.order_main` | match | no | **通过** |
+| `orderdb.order_log` | match | match | **丢弃** |
+| `orderdb.users` | no | - | **丢弃** |
+
+> **关键设计**：过滤发生在 binlog 解析阶段（LogEventConvert），不匹配的表在解码时就被丢弃，不占用 RingBuffer 空间。客户端 subscribe 时可以传入自定义 filter，动态覆盖白名单。
+
+---
+
+## 案例七：RDB Adapter —— MySQL 到 MySQL 异构同步
+
+### 场景描述
+
+业务库 `source_db.users` 实时同步到分析库 `target_db.users_mirror`，做字段映射。
+
+### 配置
+
+```yaml
+# conf/rdb/mytest_user.yml
+dbMapping:
+  database: source_db
+  table: users
+  targetTable: target_db.users_mirror
+  targetPk: { id: id }
+  targetColumns: { id: id, username: username, create_time: created_at }
+  commitBatch: 3000
+```
+
+### 全链路源码追踪
+
+**Step 1：SPI 加载 RdbAdapter**
+
+```java
+// SPI 文件：rdb=com.alibaba.otter.canal.client.adapter.rdb.RdbAdapter
+OuterAdapter adapter = loader.getExtension("rdb", ADAPTER_SPI_DIR);
+adapter.init(config, properties);
+// → 解析 yml 配置 → 创建 JDBC DataSource → 创建 RdbSyncService
+```
+
+**Step 2：RdbSyncService.sync() —— SQL 生成**
+
+```java
+// RdbSyncService.sync()
+for (Dml dml : dmls) {
+    String key = dml.getDatabase() + "-" + dml.getTable();
+    Map<String, MappingConfig> configMap = mappingConfig.get(key);
+
+    for (MappingConfig config : configMap.values()) {
+        List<SingleDml> singleDmls = SingleDml.dml2SingleDmls(dml);
+        // 拆分为单行
+
+        for (SingleDml singleDml : singleDmls) {
+            int partition = Math.abs(pkHash(...)) % threads;
+            executors[partition].submit(() -> {
+                sync(batchExecutor, config, singleDml);
+            });
+        }
+    }
+}
+```
+
+**Step 3：INSERT/UPDATE/DELETE SQL 生成**
+
+```java
+if ("INSERT".equals(type)) {
+    // 字段映射：create_time → created_at
+    Map<String, Object> targetData = getTargetColumnValues(
+        dbMapping.getTargetColumns(), dml.getData());
+    // INSERT INTO `target_db`.`users_mirror` (`id`, `username`, `created_at`)
+    //   VALUES (?, ?, ?)
+    batchExecutor.execute(sql, values);
+}
+
+if ("UPDATE".equals(type)) {
+    // 只 SET 变更的字段（通过 dml.getOld() 判断）
+    // UPDATE `target_db`.`users_mirror`
+    //   SET `email`=? WHERE `id`=?
+    batchExecutor.execute(sql, values);
+}
+
+if ("DELETE".equals(type)) {
+    // DELETE FROM `target_db`.`users_mirror` WHERE `id`=?
+    batchExecutor.execute(sql, pkValues);
+}
+
+if (batchExecutor.getCount() >= dbMapping.getCommitBatch()) {
+    batchExecutor.commit();  // 攒批提交，减少 JDBC commit 次数
+}
+```
+
+> **关键设计**：1) 按主键哈希分线程，保证同一主键的操作在同一线程内有序；2) UPDATE 只 SET 变更字段，减少写入量；3) 攒批提交（commitBatch=3000）。
+
+---
+
+## 案例八：ES Adapter —— 实时构建搜索索引
+
+### 场景描述
+
+MySQL 商品表 + 分类表做 JOIN，实时同步到 Elasticsearch 索引。
+
+### 配置
+
+```yaml
+# conf/es7/product_index.yml
+esMapping:
+  _index: products
+  _id: _id
+  sql: >
+    SELECT p.id AS _id, p.name, p.price,
+           c.category_name, p.description
+    FROM product p
+    LEFT JOIN category c ON c.id = p.category_id
+  commitBatch: 3000
+```
+
+### 全链路源码追踪
+
+**Step 1：SqlParser 解析 SQL → SchemaItem**
+
+```java
+SchemaItem schemaItem = SqlParser.parse(mappingConfig.getSql());
+// mainTable: "product" (alias "p")
+// aliasTableItems: {"p": product(main), "c": category}
+// selectFields: {"_id": p.id, "name": p.name, "category_name": c.category_name, ...}
+// relations: [("c.id", "p.category_id")]  ← JOIN 关系
+```
+
+**Step 2：主表变更 → 回查 SQL**
+
+```java
+// product 表 INSERT
+if (schemaItem.getMainTable().getTableName().equals(table)) {
+    // 有 JOIN → 必须回查数据库获取 category_name
+    // SELECT p.id AS _id, p.name, p.price,
+    //        c.category_name, p.description
+    // FROM product p LEFT JOIN category c ON c.id = p.category_id
+    // WHERE p.id = 1001
+    ResultSet rs = dataSource.query(querySql, pkValue);
+    Map<String, Object> esData = resultSetToMap(rs);
+    esTemplate.insert(mapping, pkVal, esData);
+}
+```
+
+**Step 3：关联表变更 → 反查受影响记录**
+
+```java
+// category 表 UPDATE
+// category_name 改了 → 所有引用该 category 的商品都需要更新
+
+// 反查 SQL：
+// SELECT p.id AS _id, p.name, p.price,
+//        c.category_name, p.description
+// FROM product p LEFT JOIN category c ON c.id = p.category_id
+// WHERE c.id = 5
+ResultSet rs = dataSource.query(querySql, joinValue);
+while (rs.next()) {
+    esTemplate.update(mapping, pkVal, resultSetToMap(rs));
+    // 50 个商品 → 50 条 ES update
+}
+```
+
+**Step 4：Bulk 批量提交**
+
+```java
+// 累积到 BulkRequest 中，达到阈值统一提交
+if (getBulk().numberOfActions() >= mapping.getCommitBatch()) {
+    BulkResponse response = restHighLevelClient.bulk(getBulk(), ...);
+    resetBulk();
+}
+```
+
+> **关键设计**：ES 同步是"SQL 驱动"——用 SQL 描述文档结构和字段来源。主表变更回查 JOIN SQL 获取完整数据；关联表变更反查所有受影响的主表记录批量更新。Bulk API 攒批提交。
+
+---
+
+## 案例九：Spring XML 模式 vs Manager 模式
+
+### Spring 模式
+
+```java
+// SpringCanalInstanceGenerator.generate()
+System.setProperty("canal.instance.destination", destination);
+this.beanFactory = new ClassPathXmlApplicationContext(springXml);
+// 加载 spring/file-instance.xml
+// 占位符从本地 conf/{dest}/instance.properties 读取
+return (CanalInstance) beanFactory.getBean("instance");
+```
+
+### Manager 模式
+
+```java
+// PlainCanalInstanceGenerator.generate()
+PlainCanal canal = canalConfigClient.findInstance(destination, null);
+// HTTP GET /api/v1/config/instance_polling/{destination}?md5=null
+Properties remoteProperties = canal.getProperties();
+// 占位符值来自远程 API（Canal Admin）
+remoteProperties.putAll(canalConfig);
+PropertyPlaceholderConfigurer.propertiesLocal.set(remoteProperties);
+this.beanFactory = new ClassPathXmlApplicationContext(springXml);
+// 同样的 Spring XML，但占位符的值来自远程
+return (CanalInstance) beanFactory.getBean("instance");
+```
+
+> **关键差异**：两种模式都用同一个 Spring XML 装配组件，区别在于占位符的值来源——Spring 模式从本地文件读取，Manager 模式从 Canal Admin HTTP API 远程拉取。Manager 模式适合集中管理上百个 Instance。
+
+---
+
+## 案例十：Disruptor 并行解析 —— 高吞吐 binlog 处理
+
+### 配置
+
+```properties
+canal.instance.parser.parallel = true
+canal.instance.parser.parallelThreadSize = 8
+canal.instance.parser.parallelBufferSize = 256
+```
+
+### 全链路源码追踪
+
+**Step 1：判断串行 vs 并行**
+
+```java
+// AbstractEventParser.start()
+if (parallel) {
+    // 并行模式：Disruptor 四阶段流水线
+    multiStageCoprocessor = buildMultiStageCoprocessor();
+    multiStageCoprocessor.start();
+    erosaConnection.dump(startPosition, multiStageCoprocessor);
+} else {
+    // 串行模式：单线程 SinkFunction
+    erosaConnection.dump(startPosition, new SinkFunction<LogEvent>() {
+        public boolean sink(LogEvent event) {
+            CanalEntry.Entry entry = parseAndProfilingIfNecessary(event);
+            if (entry != null) transactionBuffer.add(entry);
+            return running;
+        }
+    });
+}
+```
+
+**Step 2：Disruptor RingBuffer + 依赖链**
+
+```java
+// MysqlMultiStageCoprocessor 构造
+// Stage 1（dump线程）: publish(LogBuffer) → RingBuffer slot
+this.disruptorMsgBuffer = RingBuffer.createSingleProducer(
+    new MessageEventFactory(), 256, new BlockingWaitStrategy());
+
+// Stage 2（单线程）: LogDecoder 解码 + TableMeta
+SequenceBarrier barrier1 = disruptorMsgBuffer.newBarrier();
+simpleParserStage = new BatchEventProcessor<>(
+    disruptorMsgBuffer, barrier1, new SimpleParserStage());
+
+// Stage 3（8线程并行）: DML 行数据深度解析
+SequenceBarrier barrier2 =
+    disruptorMsgBuffer.newBarrier(simpleParserStage.getSequence());
+WorkHandler<MessageEvent>[] workers = new DmlParserStage[8];
+workerPool = new WorkerPool<>(disruptorMsgBuffer, barrier2, handler, workers);
+
+// Stage 4（单线程）: 按序号顺序投递到 EventTransactionBuffer
+SequenceBarrier barrier3 =
+    disruptorMsgBuffer.newBarrier(workerPool.getWorkerSequences());
+sinkStoreStage = new BatchEventProcessor<>(
+    disruptorMsgBuffer, barrier3, new SinkStoreStage());
+
+disruptorMsgBuffer.addGatingSequences(sinkStoreStage.getSequence());
+```
+
+**四阶段流水线**：
+
+```
+Stage 1 (dump线程)     Stage 2 (单线程)       Stage 3 (8线程并行)    Stage 4 (单线程)
+publish(LogBuffer) → SimpleParserStage    → DmlParserStage[]    → SinkStoreStage
+                     LogDecoder解码          行数据深度解析          按序号顺序投递
+                     TableMeta预处理         CPU密集型并行          保证binlog原始顺序
+                     标记needDmlParse        多线程处理不同slot     → transactionBuffer
+```
+
+> **关键设计**：Stage 2 必须单线程（TableMapEvent 必须在 RowsEvent 前处理）。Stage 3 多线程并行处理不同 DML 事件（CPU 密集型反序列化）。Stage 4 按 RingBuffer 序号严格顺序消费——保证最终投递顺序 = binlog 原始顺序。"重活并行、投递保序"。
+
+---
+
+## 案例十一：RocketMQ 模式 —— 与 Kafka 的链路差异
+
+### 配置
+
+```properties
+canal.serverMode = rocketMQ
+canal.mq.servers = rmq-namesrv:9876
+canal.mq.producerGroup = canal_producer
+```
+
+### 与 Kafka 的源码分歧点
+
+**SPI 加载不同 Producer**：
+
+```java
+// SPI: rocketmq=...CanalRocketMQProducer
+canalMQProducer = loader.getExtension("rocketmq");
+```
+
+**初始化差异**：
+
+```java
+// CanalRocketMQProducer.init()
+DefaultMQProducer producer = new DefaultMQProducer();
+producer.setNamesrvAddr("rmq-namesrv:9876");
+producer.setProducerGroup("canal_producer");
+// 阿里云 ACL 认证
+if (StringUtils.isNotEmpty(config.getAccessKey())) {
+    producer = new DefaultMQProducer(new AclClientRPCHook(
+        new SessionCredentials(config.getAccessKey(), config.getSecretKey())));
+}
+producer.start();
+```
+
+**发送方式差异 —— 同步 vs 异步**：
+
+```java
+// Kafka: 异步发送 + flush + 等待 Future
+Future<RecordMetadata> future = producer.send(record);  // 异步
+producer.flush();
+future.get();  // 等待
+
+// RocketMQ: 同步发送
+SendResult result = defaultMQProducer.send(message,
+    (mqs, msg, arg) -> mqs.get((int)arg % mqs.size()),  // MessageQueueSelector
+    targetPartition);  // 同步阻塞
+if (result.getSendStatus() != SendStatus.SEND_OK) {
+    throw new RuntimeException("Send failed");
+}
+```
+
+**RocketMQ 独有 Tag 支持**：
+
+```java
+// RocketMQ 支持 Tag 过滤
+Message message = new Message(topic, config.getTag(), body);
+// 下游：consumer.subscribe("canal_data", "tagA || tagB")
+// Kafka 没有 Tag，只能用不同 topic
+```
+
+> **关键差异**：Kafka 是批量异步发送，RocketMQ 是逐条同步发送。RocketMQ 延迟更高但可靠性更强（不需要 in-flight=1 保证顺序）。RocketMQ 支持 Tag 过滤，Kafka 靠多 topic 实现。
+
+---
+
+## 案例十二：心跳检测与 MySQL 连接自愈
+
+### 配置
+
+```properties
+canal.instance.detecting.enable = true
+canal.instance.detecting.sql = select 1
+canal.instance.detecting.interval.time = 3
+canal.instance.detecting.retry.threshold = 3
+canal.instance.detecting.heartbeatHaEnable = false
+```
+
+### 全链路源码追踪
+
+**Step 1：启动心跳定时任务**
+
+```java
+// AbstractEventParser.startHeartBeat()
+if (detectingEnable) {
+    TimerTask task = buildHeartBeatTimeTask(connection);
+    timer.schedule(task, 3000L, 3000L);  // 每 3 秒一次
+}
+```
+
+**Step 2：心跳 SQL 执行**
+
+```java
+// MysqlDetectingTimeTask.run()
+public void run() {
+    try {
+        if (reconnect) {
+            mysqlConnection.reconnect();  // 上次失败，先重连
+            reconnect = false;
+        }
+        mysqlConnection.query(detectingSQL);  // "select 1"
+        haController.onSuccess(costTime);     // 重置失败计数
+    } catch (Exception e) {
+        reconnect = true;
+        haController.onFailed(e);             // 累加失败计数
+    }
+}
+```
+
+**Step 3：失败计数与 HA 切换**
+
+```java
+// HeartBeatHAController.onFailed()
+public void onFailed(Throwable e) {
+    failedTimes++;
+    if (failedTimes > detectingRetryTimes) {  // > 3
+        if (switchEnable) {
+            // heartbeatHaEnable = true → 自动切换主备
+            eventParser.doSwitch();
+        } else {
+            // heartbeatHaEnable = false → 只告警
+            logger.warn("HeartBeat failed {} times", failedTimes);
+        }
+    }
+}
+```
+
+**Step 4：dump 线程兜底重连**
+
+```java
+// AbstractEventParser.start() 中的 parseThread
+while (running) {
+    try {
+        erosaConnection.connect();
+        erosaConnection.dump(startPosition, sinkFunction);
+    } catch (Exception e) {
+        logger.error("dump error, retrying...", e);
+    } finally {
+        erosaConnection.disconnect();
+    }
+    if (running) {
+        Thread.sleep(10000 + RandomUtils.nextInt(10000));
+        // 10~20 秒随机延迟后重试
+    }
+}
+```
+
+> **两层保护**：心跳检测是"提前发现"（每 3 秒探测一次），dump 循环是"兜底重连"（异常后 10~20 秒重试）。心跳使用独立连接（`connection.fork()`），不干扰主 dump 连接。
+
+---
+
+## 案例十三：全量同步 —— Client Adapter ETL 模式
+
+### 触发方式
+
+```bash
+curl -X POST http://canal-adapter:8081/etl/es7/product_index.yml
+```
+
+### 全链路源码追踪
+
+**Step 1：REST 接口**
+
+```java
+// CommonRest.etl()
+@PostMapping("/etl/{type}/{key}/{task}")
+public EtlResult etl(...) {
+    // 1. 获取 ETL 锁（防止并发）
+    boolean locked = etlLock.tryLock(type + "-" + key);
+    try {
+        // 2. 暂停增量同步
+        syncSwitch.off(destination);
+
+        // 3. 执行全量同步
+        EtlResult result = adapter.etl(task, params);
+
+        return result;
+    } finally {
+        // 4. 恢复增量同步
+        syncSwitch.on(destination);
+        etlLock.unlock(type + "-" + key);
+    }
+}
+```
+
+**Step 2：分页多线程导入**
+
+```java
+// AbstractEtlService.importData()
+long cnt = dataSource.queryForLong("SELECT COUNT(1) FROM (" + sql + ") _CNT");
+// cnt = 1000000
+
+if (cnt >= 10000) {
+    int threadCount = Runtime.getRuntime().availableProcessors();  // 8
+    int pageSize = 10000;
+    int totalPages = (int) Math.ceil((double) cnt / pageSize);    // 100
+
+    ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+    for (int page = 0; page < totalPages; page++) {
+        final int offset = page * pageSize;
+        executor.submit(() -> {
+            String pageSql = sql + " LIMIT " + offset + "," + pageSize;
+            ResultSet rs = dataSource.query(pageSql);
+            while (rs.next()) {
+                esTemplate.insert(mapping, pkVal, resultSetToMap(rs));
+            }
+            esTemplate.commit();
+        });
+    }
+    // 等待所有分页任务完成
+    for (Future<Boolean> future : futures) { future.get(); }
+} else {
+    // 小数据量：单线程直接导入
+    ResultSet rs = dataSource.query(sql);
+    while (rs.next()) {
+        esTemplate.insert(mapping, pkVal, resultSetToMap(rs));
+    }
+    esTemplate.commit();
+}
+```
+
+**RDB Adapter 的全量同步差异 —— DELETE + INSERT 幂等模式**：
+
+```java
+// RdbEtlService.executeSqlImport()
+while (rs.next()) {
+    // 先删除（幂等）
+    // DELETE FROM target_db.users_mirror WHERE id = ?
+    batchExecutor.execute(deleteSql, pkValues);
+    // 再插入
+    // INSERT INTO target_db.users_mirror (id, username, ...) VALUES (?, ?, ...)
+    batchExecutor.execute(insertSql, columnValues);
+
+    if (impCount.get() % dbMapping.getCommitBatch() == 0) {
+        batchExecutor.commit();  // 每 5000 条提交一次
+    }
+}
+batchExecutor.commit();  // 最后一批
+```
+
+> **关键设计**：1) 暂停增量同步（syncSwitch.off）避免全量和增量同时写入；2) 分页 + 多线程并行导入；3) RDB 用 DELETE+INSERT 保证幂等性；4) 恢复增量后从暂停位点继续消费，不丢数据。
+
+---
+
+## 案例十四：Group 模式 —— 多源合并（分库分表聚合）
+
+### 场景描述
+
+三个分库 `user_0`、`user_1`、`user_2` 的变更合并到一个下游消费流中。
+
+### 配置
+
+```xml
+<!-- spring/group-instance.xml -->
+<bean id="instance" class="...CanalInstanceWithManager">
+    <property name="eventParser">
+        <bean class="...GroupEventParser">
+            <property name="eventParsers">
+                <list>
+                    <ref bean="mysqlEventParser_0" />
+                    <ref bean="mysqlEventParser_1" />
+                    <ref bean="mysqlEventParser_2" />
+                </list>
+            </property>
+        </bean>
+    </property>
+    <property name="eventSink">
+        <bean class="...GroupEventSink" />
+    </property>
+</bean>
+```
+
+### 全链路源码追踪
+
+**Step 1：GroupEventParser.start() —— 启动多个子 Parser**
+
+```java
+public void start() {
+    super.start();
+    for (CanalEventParser parser : eventParsers) {
+        parser.start();
+        // mysqlEventParser_0 → 连接 mysql-shard0:3306
+        // mysqlEventParser_1 → 连接 mysql-shard1:3306
+        // mysqlEventParser_2 → 连接 mysql-shard2:3306
+    }
+    // 三个 dump 线程并行运行
+}
+```
+
+**Step 2：GroupEventSink + TimelineBarrier —— 多源合并排序**
+
+```java
+public class GroupEventSink extends EntryEventSink {
+    private TimelineBarrier barrier;
+
+    public boolean sink(List<CanalEntry.Entry> entrys,
+                        InetSocketAddress remoteAddress,
+                        String destination) throws InterruptedException {
+        // 1. 通过 remoteAddress 识别数据来源
+        // 2. TimelineBarrier.await() 等待各源时间戳对齐
+        barrier.await(remoteAddress, entrys);
+        // 3. 按时间戳全局排序后投递
+        return super.sink(entrys, remoteAddress, destination);
+    }
+}
+```
+
+**Step 3：TimelineBarrier —— 水位线对齐算法**
+
+```java
+public void await(InetSocketAddress source, List<CanalEntry.Entry> entries) {
+    long maxTimestamp = getMaxTimestamp(entries);
+    timelineMap.put(source, maxTimestamp);
+    // timelineMap = {
+    //   shard0 → 1704067200000,
+    //   shard1 → 1704067198000,
+    //   shard2 → 1704067195000  ← 最慢
+    // }
+    long minTimestamp = Collections.min(timelineMap.values());
+    if (maxTimestamp - minTimestamp > threshold) {
+        // 当前源太快，等待慢的源追上
+        waitForOthers();
+    }
+}
+```
+
+**多源合并数据流图**：
+
+```
+mysql-shard0 ──→ Parser_0 ──→
+                               ↘
+mysql-shard1 ──→ Parser_1 ──→ GroupEventSink ──→ EventStore ──→ 客户端
+                               ↗   (TimelineBarrier
+mysql-shard2 ──→ Parser_2 ──→      时间线排序)
+```
+
+| 组件 | 普通模式 | Group 模式 |
+|------|---------|----------|
+| EventParser | MysqlEventParser | GroupEventParser（N 个子 Parser）|
+| EventSink | EntryEventSink | GroupEventSink + TimelineBarrier |
+| MySQL 连接数 | 1 | N |
+| 线程数 | 1 dump 线程 | N 个 dump 线程 |
+
+> **关键设计**：TimelineBarrier 通过"水位线"机制确保：不会让最快的源太超前，避免下游看到时间乱序的数据。TimelineTransactionBarrier（事务感知版本）还保证完整事务不被打断。
+
+---
+
+## 各案例涉及的代码路径总览
+
+| 分歧点 | 判断条件 | 走 A 路径 | 走 B 路径 |
+|--------|---------|----------|----------|
+| TCP vs MQ | `canal.serverMode` | `=tcp` → CanalServerWithNetty | `=kafka/rocketmq` → CanalMQStarter |
+| 单机 vs HA | `canal.zkServers` | 为空 → 直接启动 | 非空 → ZK 临时节点竞争 |
+| Netty 开关 | `canal.withoutNetty` | `=false` → 创建 Netty | `=true` → 不创建 |
+| GTID vs file+pos | `canal.instance.gtidon` | `=false` → COM_BINLOG_DUMP | `=true` → COM_BINLOG_DUMP_GTID |
+| 并行 vs 串行 | `canal.instance.parser.parallel` | `=false` → 单线程 | `=true` → Disruptor 4 阶段 |
+| Spring vs Manager | `canal.instance.global.mode` | `=spring` → 本地配置 | `=manager` → 远程 API |
+| 动态 Topic | `canal.mq.dynamicTopic` | 为空 → 单 topic | 非空 → 按表名路由 |
+| 分区哈希 | `canal.mq.partitionHash` | 为空 → 固定分区 | 非空 → PK 哈希 |
+| 心跳检测 | `canal.instance.detecting.enable` | `=false` → 被动心跳 | `=true` → SQL 心跳 |
+| HA 切换 | `heartbeatHaEnable` | `=false` → 只告警 | `=true` → 自动切换主备 |
+| 单源 vs 多源 | EventParser 类型 | MysqlEventParser | GroupEventParser |
+| MetaManager | Spring XML | file-instance.xml → 文件 | default-instance.xml → ZK |
+| MQ Producer | `canal.serverMode` | `=kafka` → KafkaProducer | `=rocketmq` → RocketMQProducer |
+| ES 同步策略 | 主表 vs 关联表 | 主表 → 直接映射/回查 | 关联表 → 反查受影响记录 |
